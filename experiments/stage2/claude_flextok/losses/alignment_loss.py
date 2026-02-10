@@ -17,7 +17,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from itertools import combinations
 from typing import Dict, Optional, List
-from timm.utils import accuracy
+
+def topk_accuracy(output, target, topk=(1,)):
+    """Top-k accuracy (matches timm.utils.accuracy interface)."""
+    maxk = min(max(topk), output.size(1))
+    batch_size = target.size(0)
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.reshape(1, -1).expand_as(pred))
+    return [correct[:min(k, maxk)].reshape(-1).float().sum(0) * 100. / batch_size for k in topk]
 
 
 class CrossModalAlignmentLoss(nn.Module):
@@ -113,8 +121,8 @@ class CrossModalAlignmentLoss(nn.Module):
     def get_acc_from_affinity(self, affinity_matrix: torch.Tensor) -> tuple:
         """Compute top-1 and top-5 retrieval accuracy from affinity matrix."""
         labels = torch.arange(affinity_matrix.shape[0], device=affinity_matrix.device, dtype=torch.long)
-        acc1, acc5 = accuracy(affinity_matrix, labels, topk=(1, min(5, affinity_matrix.shape[0])))
-        acc1_t, acc5_t = accuracy(affinity_matrix.T, labels, topk=(1, min(5, affinity_matrix.shape[0])))
+        acc1, acc5 = topk_accuracy(affinity_matrix, labels, topk=(1, min(5, affinity_matrix.shape[0])))
+        acc1_t, acc5_t = topk_accuracy(affinity_matrix.T, labels, topk=(1, min(5, affinity_matrix.shape[0])))
         return (acc1 + acc1_t) / 2, (acc5 + acc5_t) / 2
 
     def forward(
