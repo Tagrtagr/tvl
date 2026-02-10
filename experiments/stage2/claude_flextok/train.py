@@ -1,18 +1,19 @@
 """
 Stage 2 Training Script: Cross-Modality Alignment with Register Tokens.
+Approach: FlexTok-inspired register tokens (Claude Code)
 
 Trains learnable register token modules on top of frozen Stage-1 encoders
 to align vision and tactile representations in a shared latent space.
 
 Usage:
     # Single GPU
-    python experiments/stage2/train.py \
+    python experiments/stage2/claude_flextok/train.py \
         --stage1_checkpoint /path/to/stage1/checkpoint.pth \
         --datasets_dir /path/to/datasets \
         --output_dir ./output/stage2
 
     # Multi-GPU (DDP)
-    torchrun --nproc_per_node=4 experiments/stage2/train.py \
+    torchrun --nproc_per_node=4 experiments/stage2/claude_flextok/train.py \
         --stage1_checkpoint /path/to/stage1/checkpoint.pth \
         --datasets_dir /path/to/datasets
 """
@@ -39,8 +40,10 @@ from torch.utils.tensorboard import SummaryWriter
 import yaml
 
 # Add parent directories to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../tvl_enc"))
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)  # for local models/ and losses/ imports
+sys.path.insert(0, os.path.join(_here, "../../.."))  # project root
+sys.path.insert(0, os.path.join(_here, "../../../tvl_enc"))  # tvl_enc utilities
 
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler

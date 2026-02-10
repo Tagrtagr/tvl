@@ -1,11 +1,12 @@
 """
-Quick smoke test for Stage 2 modules.
-Run: python experiments/stage2/test_modules.py
+Quick smoke test for Stage 2 modules (Claude Code FlexTok approach).
+Run: python experiments/stage2/claude_flextok/test_modules.py
 """
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(__file__))
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)
 
 import torch
 from models.register_tokens import RegisterTokenModule
