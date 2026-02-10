@@ -1,0 +1,55 @@
+EXPERIMENT METADATA
+===================
+
+Experiment ID: cursor_flux_talk_register_tokens
+Created By: Cursor (Composer)
+Model: Composer (Cursor's AI coding assistant)
+Date: February 7, 2026
+Version: 1.0
+
+DESCRIPTION
+-----------
+CURSOR IMPLEMENTATION: FluxTalk-style register tokens implementation for Stage 2 
+cross-modality alignment. Uses nested dropout and contrastive learning on 
+overlapping tokens.
+
+KEY CHARACTERISTICS
+-------------------
+- 4 register tokens (3 overlapping + 1 complementary)
+- Per-modality token processing
+- Nested dropout with linear schedule
+- Contrastive alignment loss
+- Complementary token regularization
+
+CLASSES
+-------
+- RegisterTokenModule: Main model class
+- RegisterTokenLoss: Loss function class
+
+FILES
+-----
+- register_tokens.py: Model implementation
+- loss.py: Loss function  
+- engine.py: Training/evaluation loops
+- train.py: Main training script
+- __init__.py: Package initialization
+- README.md: Documentation
+- METADATA.txt: This file
+
+IMPORT
+------
+from experiments.stage2.cursor.register_tokens import RegisterTokenModule
+from experiments.stage2.cursor.loss import RegisterTokenLoss
+
+IDENTIFICATION
+--------------
+- All files have "CURSOR IMPLEMENTATION" header
+- Logs prefixed with [CURSOR]
+- Experiment ID: cursor_flux_talk_register_tokens
+- Log entries include 'implementation': 'cursor'
+
+NOTES
+-----
+This implementation was created by Cursor's Composer AI assistant.
+All files include header comments with creation metadata for tracking.
+This is one of several experimental approaches being tested.
