@@ -74,28 +74,32 @@ class ReconstructionDecoder(nn.Module):
 
         self.token_norm = nn.LayerNorm(hidden_dim)
 
-        # Project flattened tokens to spatial feature map
+        # Bottleneck: project each token to smaller dim before flattening
+        # This avoids a massive (n_reg*hidden_dim x base_channels*49) linear
+        bottleneck_dim = hidden_dim // 4  # 512 -> 128
+        self.token_proj = nn.Linear(hidden_dim, bottleneck_dim)
+
+        # Project bottlenecked tokens to spatial feature map
         self.to_spatial = nn.Linear(
-            n_registers * hidden_dim, base_channels * self.h0 * self.w0
+            n_registers * bottleneck_dim, base_channels * self.h0 * self.w0
         )
 
         # Progressive upsampling: 7 -> 14 -> 28 -> 56 -> 112 -> 224
+        # Channel widths scale with base_channels
+        c = base_channels
+        c2, c4, c8 = max(c // 2, 8), max(c // 4, 8), max(c // 8, 8)
         self.upsample = nn.Sequential(
-            # 7x7 -> 14x14
-            _UpBlock(base_channels, 256),
-            # 14x14 -> 28x28
-            _UpBlock(256, 128),
-            # 28x28 -> 56x56
-            _UpBlock(128, 64),
-            # 56x56 -> 112x112
-            _UpBlock(64, 32),
-            # 112x112 -> 224x224
-            _UpBlock(32, 16),
+            _UpBlock(c, c),      # 7x7 -> 14x14
+            _UpBlock(c, c2),     # 14x14 -> 28x28
+            _UpBlock(c2, c4),    # 28x28 -> 56x56
+            _UpBlock(c4, c8),    # 56x56 -> 112x112
+            _UpBlock(c8, c8),    # 112x112 -> 224x224
         )
+        self._final_channels = c8
 
         # Final projection to output channels (no activation — output is
         # in normalized image space which can be negative)
-        self.to_pixels = nn.Conv2d(16, output_channels, kernel_size=3, padding=1)
+        self.to_pixels = nn.Conv2d(c8, output_channels, kernel_size=3, padding=1)
 
         self._init_weights()
 
@@ -120,8 +124,9 @@ class ReconstructionDecoder(nn.Module):
         x = self.token_processor(register_tokens)
         x = self.token_norm(x)
 
-        # Flatten and project to spatial features
-        x = x.reshape(B, -1)  # (B, n_reg * hidden_dim)
+        # Bottleneck projection per token, then flatten
+        x = self.token_proj(x)  # (B, n_reg, bottleneck_dim)
+        x = x.reshape(B, -1)  # (B, n_reg * bottleneck_dim)
         x = self.to_spatial(x)  # (B, base_channels * h0 * w0)
         x = x.reshape(B, self.base_channels, self.h0, self.w0)
 

@@ -98,7 +98,7 @@ def get_args_parser():
     parser.add_argument("--use_reconstruction", action="store_true", default=False,
                         help="Enable reconstruction decoder (FlexTok-style)")
     parser.add_argument("--reconstruction_weight", type=float, default=1.0)
-    parser.add_argument("--recon_base_channels", type=int, default=256)
+    parser.add_argument("--recon_base_channels", type=int, default=64)
     parser.add_argument("--recon_decoder_layers", type=int, default=2)
     parser.add_argument("--recon_loss_type", type=str, default="mse",
                         choices=["mse", "l1", "smooth_l1"])
