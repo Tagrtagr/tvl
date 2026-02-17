@@ -216,7 +216,7 @@ def build_model(args, device):
     # Vision: OpenCLIP ViT-L-14 outputs 768-dim
     # Tactile: depends on tactile_model + whether num_classes matches CLIP width
     vision_dim = frozen_encoder.clip.visual.output_dim if hasattr(frozen_encoder.clip.visual, "output_dim") else 768
-    tactile_dim = frozen_encoder.clip.transformer.width if frozen_encoder.tactile_encoder.num_classes > 0 else frozen_encoder.tactile_encoder.num_features
+    tactile_dim = frozen_encoder.tactile_encoder.num_classes if frozen_encoder.tactile_encoder.num_classes > 0 else frozen_encoder.tactile_encoder.num_features
 
     modality_configs = {
         ModalityType.VISION: {"input_dim": vision_dim, "feature_type": "pooled"},
