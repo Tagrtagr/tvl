@@ -263,13 +263,19 @@ def build_loss(args, device):
     return contrastive_loss, flow_loss
 
 
+def _unwrap(model):
+    """Unwrap DDP model to access inner attributes."""
+    return model.module if hasattr(model, "module") else model
+
+
 def train_one_epoch(
     model, contrastive_loss_fn, flow_loss_fn, data_loader,
     optimizer, device, epoch, loss_scaler, args, log_writer=None,
 ):
     model.train()
     # Keep frozen encoder in eval mode
-    model.frozen_encoder.eval()
+    model_inner = _unwrap(model)
+    model_inner.frozen_encoder.eval()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
@@ -293,13 +299,13 @@ def train_one_epoch(
         with torch.cuda.amp.autocast():
             # Get frozen features
             with torch.no_grad():
-                frozen_features = model.encode(samples)
+                frozen_features = model_inner.encode(samples)
 
             # Forward through alignment model
-            alignment_output = model.alignment_model(frozen_features)
+            alignment_output = model_inner.alignment_model(frozen_features)
 
             # Contrastive + preservation loss
-            preservation_projectors = model.alignment_model.preservation_projectors if hasattr(model, 'alignment_model') else (model.module.alignment_model.preservation_projectors if hasattr(model, 'module') else None)
+            preservation_projectors = model_inner.alignment_model.preservation_projectors
             loss_dict = contrastive_loss_fn(
                 alignment_output,
                 frozen_features=frozen_features,
@@ -323,7 +329,7 @@ def train_one_epoch(
         loss /= accum_iter
 
         # Collect trainable parameters
-        trainable_params = list(model.alignment_model.parameters())
+        trainable_params = list(model_inner.alignment_model.parameters())
         if flow_loss_fn is not None:
             trainable_params += list(flow_loss_fn.parameters())
 
@@ -361,6 +367,7 @@ def evaluate(
     metric_logger = misc.MetricLogger(delimiter="  ")
     header = "Test:"
     model.eval()
+    model_inner = _unwrap(model)
 
     for batch in metric_logger.log_every(data_loader, 10, header):
         for k, v in batch.items():
@@ -370,9 +377,9 @@ def evaluate(
             batch_size = v.shape[0]
 
         with torch.cuda.amp.autocast():
-            frozen_features = model.encode(batch)
-            alignment_output = model.alignment_model(frozen_features)
-            preservation_projectors = model.alignment_model.preservation_projectors if hasattr(model, 'alignment_model') else (model.module.alignment_model.preservation_projectors if hasattr(model, 'module') else None)
+            frozen_features = model_inner.encode(batch)
+            alignment_output = model_inner.alignment_model(frozen_features)
+            preservation_projectors = model_inner.alignment_model.preservation_projectors
             loss_dict = contrastive_loss_fn(
                 alignment_output,
                 frozen_features=frozen_features,
