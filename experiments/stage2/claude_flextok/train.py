@@ -60,8 +60,10 @@ from tvl_enc.tacvis import (
 )
 
 from models.cross_modal_alignment import CrossModalAlignmentModel, Stage2Wrapper
+from models.reconstruction_decoder import ReconstructionDecoder
 from losses.alignment_loss import CrossModalAlignmentLoss
 from losses.flow_matching import FlowMatchingAlignmentLoss
+from losses.reconstruction_loss import ReconstructionLoss
 
 try:
     import wandb
@@ -91,6 +93,15 @@ def get_args_parser():
     parser.add_argument("--contrastive_weight", type=float, default=1.0)
     parser.add_argument("--preservation_weight", type=float, default=0.5)
     parser.add_argument("--flow_weight", type=float, default=0.5)
+
+    # Reconstruction
+    parser.add_argument("--use_reconstruction", action="store_true", default=False,
+                        help="Enable reconstruction decoder (FlexTok-style)")
+    parser.add_argument("--reconstruction_weight", type=float, default=1.0)
+    parser.add_argument("--recon_base_channels", type=int, default=256)
+    parser.add_argument("--recon_decoder_layers", type=int, default=2)
+    parser.add_argument("--recon_loss_type", type=str, default="mse",
+                        choices=["mse", "l1", "smooth_l1"])
 
     # Training
     parser.add_argument("--batch_size", default=256, type=int)
@@ -271,11 +282,15 @@ def _unwrap(model):
 def train_one_epoch(
     model, contrastive_loss_fn, flow_loss_fn, data_loader,
     optimizer, device, epoch, loss_scaler, args, log_writer=None,
+    recon_decoders=None, recon_loss_fn=None,
 ):
     model.train()
     # Keep frozen encoder in eval mode
     model_inner = _unwrap(model)
     model_inner.frozen_encoder.eval()
+    if recon_decoders is not None:
+        for dec in recon_decoders.values():
+            dec.train()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
@@ -321,6 +336,23 @@ def train_one_epoch(
                 loss = loss + args.flow_weight * flow_loss
                 loss_dict["flow_loss"] = flow_loss
 
+            # Reconstruction loss (if enabled)
+            if recon_decoders is not None and recon_loss_fn is not None:
+                recons = {}
+                targets = {}
+                for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+                    all_tokens_key = f"{mod_name}_all_tokens"
+                    if all_tokens_key in alignment_output and mod_name in samples:
+                        recons[mod_name] = recon_decoders[mod_name](alignment_output[all_tokens_key])
+                        targets[mod_name] = samples[mod_name]
+                if recons:
+                    recon_dict = recon_loss_fn(recons, targets)
+                    recon_loss = recon_dict["recon_total"]
+                    loss = loss + args.reconstruction_weight * recon_loss
+                    for k, v in recon_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            loss_dict[k] = v
+
         loss_value = loss.item()
         if not math.isfinite(loss_value):
             print(f"Loss is {loss_value}, stopping training")
@@ -332,6 +364,9 @@ def train_one_epoch(
         trainable_params = list(model_inner.alignment_model.parameters())
         if flow_loss_fn is not None:
             trainable_params += list(flow_loss_fn.parameters())
+        if recon_decoders is not None:
+            for dec in recon_decoders.values():
+                trainable_params += list(dec.parameters())
 
         loss_scaler(loss, optimizer, parameters=trainable_params,
                     update_grad=(data_iter_step + 1) % accum_iter == 0)
@@ -363,11 +398,15 @@ def train_one_epoch(
 @torch.no_grad()
 def evaluate(
     data_loader, contrastive_loss_fn, model, device, epoch=None, log_writer=None,
+    recon_decoders=None, recon_loss_fn=None, args=None,
 ):
     metric_logger = misc.MetricLogger(delimiter="  ")
     header = "Test:"
     model.eval()
     model_inner = _unwrap(model)
+    if recon_decoders is not None:
+        for dec in recon_decoders.values():
+            dec.eval()
 
     for batch in metric_logger.log_every(data_loader, 10, header):
         for k, v in batch.items():
@@ -387,7 +426,26 @@ def evaluate(
                 output_dict=True,
             )
 
+            # Reconstruction loss (if enabled)
+            if recon_decoders is not None and recon_loss_fn is not None:
+                recons = {}
+                targets = {}
+                for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+                    all_tokens_key = f"{mod_name}_all_tokens"
+                    if all_tokens_key in alignment_output and mod_name in batch:
+                        recons[mod_name] = recon_decoders[mod_name](alignment_output[all_tokens_key])
+                        targets[mod_name] = batch[mod_name]
+                if recons:
+                    recon_dict = recon_loss_fn(recons, targets)
+                    for k_r, v_r in recon_dict.items():
+                        if isinstance(v_r, torch.Tensor):
+                            loss_dict[k_r] = v_r
+
         loss = loss_dict["total_loss"]
+        recon_total = loss_dict.get("recon_total")
+        if recon_total is not None:
+            recon_weight = args.reconstruction_weight if args is not None else 1.0
+            loss = loss + recon_weight * recon_total
         metric_logger.update(loss=loss.item())
 
         acc1 = loss_dict.get("acc1_avg")
@@ -458,6 +516,26 @@ def main(args):
     model = build_model(args, device)
     model_without_ddp = model
 
+    # Build reconstruction decoders (if enabled)
+    recon_decoders = None
+    recon_loss_fn = None
+    if args.use_reconstruction:
+        recon_decoders = {}
+        for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+            recon_decoders[mod_name] = ReconstructionDecoder(
+                n_registers=args.n_registers,
+                hidden_dim=args.hidden_dim,
+                base_channels=args.recon_base_channels,
+                n_decoder_layers=args.recon_decoder_layers,
+                n_heads=args.n_heads,
+            ).to(device)
+        recon_loss_fn = ReconstructionLoss(loss_type=args.recon_loss_type)
+        n_decoder_params = sum(
+            sum(p.numel() for p in dec.parameters())
+            for dec in recon_decoders.values()
+        )
+        print(f"Reconstruction decoders: {n_decoder_params:,} parameters ({len(recon_decoders)} modalities)")
+
     # Logging
     if global_rank == 0 and args.log_dir is not None and HAS_TENSORBOARD:
         os.makedirs(args.log_dir, exist_ok=True)
@@ -484,6 +562,9 @@ def main(args):
     contrastive_loss_fn, flow_loss_fn = build_loss(args, device)
     if flow_loss_fn is not None:
         alignment_params += list(flow_loss_fn.parameters())
+    if recon_decoders is not None:
+        for dec in recon_decoders.values():
+            alignment_params += list(dec.parameters())
 
     # Effective batch size for LR scaling
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
@@ -507,6 +588,12 @@ def main(args):
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scaler" in ckpt:
             loss_scaler.load_state_dict(ckpt["scaler"])
+        if recon_decoders is not None:
+            for mod_name, dec in recon_decoders.items():
+                key = f"recon_decoder_{mod_name}"
+                if key in ckpt:
+                    dec.load_state_dict(ckpt[key])
+                    print(f"  Loaded reconstruction decoder for {mod_name}")
         args.start_epoch = ckpt.get("epoch", 0) + 1
 
     # Training loop
@@ -521,10 +608,13 @@ def main(args):
         train_stats = train_one_epoch(
             model, contrastive_loss_fn, flow_loss_fn, data_loader_train,
             optimizer, device, epoch, loss_scaler, args, log_writer=log_writer,
+            recon_decoders=recon_decoders, recon_loss_fn=recon_loss_fn,
         )
 
         val_stats = evaluate(data_loader_val, contrastive_loss_fn, model, device,
-                             epoch=epoch, log_writer=log_writer)
+                             epoch=epoch, log_writer=log_writer,
+                             recon_decoders=recon_decoders, recon_loss_fn=recon_loss_fn,
+                             args=args)
 
         acc1 = val_stats.get("acc1", 0.0)
         print(f"Epoch {epoch}: val_loss={val_stats.get('loss', 0):.4f}, val_acc1={acc1:.1f}%")
@@ -540,6 +630,9 @@ def main(args):
             }
             if flow_loss_fn is not None:
                 save_dict["flow_loss"] = flow_loss_fn.state_dict()
+            if recon_decoders is not None:
+                for mod_name, dec in recon_decoders.items():
+                    save_dict[f"recon_decoder_{mod_name}"] = dec.state_dict()
 
             if acc1 > best_acc1:
                 best_acc1 = acc1

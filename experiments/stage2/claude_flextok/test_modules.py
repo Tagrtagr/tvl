@@ -13,6 +13,8 @@ from models.register_tokens import RegisterTokenModule
 from models.cross_modal_alignment import CrossModalAlignmentModel
 from losses.alignment_loss import CrossModalAlignmentLoss
 from losses.flow_matching import FlowMatchingAlignmentLoss
+from models.reconstruction_decoder import ReconstructionDecoder
+from losses.reconstruction_loss import ReconstructionLoss
 
 
 def test_register_tokens():
@@ -141,6 +143,90 @@ def test_flow_matching():
     print("  PASSED")
 
 
+def test_reconstruction_decoder():
+    print("Testing ReconstructionDecoder...")
+    decoder = ReconstructionDecoder(
+        n_registers=16, hidden_dim=256, base_channels=128,
+        n_decoder_layers=1, n_heads=4,
+    )
+
+    # Simulate all register tokens (shared + private)
+    tokens = torch.randn(4, 16, 256)
+    recon = decoder(tokens)
+    print(f"  input: {tokens.shape}")
+    print(f"  output: {recon.shape}")
+    assert recon.shape == (4, 3, 224, 224), f"Expected (4, 3, 224, 224), got {recon.shape}"
+
+    # Check gradients flow
+    recon.sum().backward()
+    has_grad = any(p.grad is not None for p in decoder.parameters())
+    assert has_grad, "No gradients in decoder!"
+    print(f"  params: {sum(p.numel() for p in decoder.parameters()):,}")
+    print("  PASSED")
+
+
+def test_reconstruction_loss():
+    print("Testing ReconstructionLoss...")
+    loss_fn = ReconstructionLoss(loss_type="mse")
+
+    recons = {"vision": torch.randn(4, 3, 224, 224), "tactile": torch.randn(4, 3, 224, 224)}
+    targets = {"vision": torch.randn(4, 3, 224, 224), "tactile": torch.randn(4, 3, 224, 224)}
+
+    losses = loss_fn(recons, targets)
+    print(f"  recon_pixel_vision: {losses['recon_pixel_vision'].item():.4f}")
+    print(f"  recon_pixel_tactile: {losses['recon_pixel_tactile'].item():.4f}")
+    print(f"  recon_total: {losses['recon_total'].item():.4f}")
+    assert losses["recon_total"].item() > 0
+    print("  PASSED")
+
+
+def test_reconstruction_backward():
+    print("Testing reconstruction end-to-end backward...")
+    model = CrossModalAlignmentModel(
+        modality_configs={
+            "vision": {"input_dim": 768, "feature_type": "pooled"},
+            "tactile": {"input_dim": 768, "feature_type": "pooled"},
+        },
+        hidden_dim=256, n_registers=16, n_shared=4,
+        n_layers=2, n_heads=4,
+    )
+    decoder_vision = ReconstructionDecoder(
+        n_registers=16, hidden_dim=256, base_channels=64,
+        n_decoder_layers=1, n_heads=4,
+    )
+    decoder_tactile = ReconstructionDecoder(
+        n_registers=16, hidden_dim=256, base_channels=64,
+        n_decoder_layers=1, n_heads=4,
+    )
+    recon_loss_fn = ReconstructionLoss(loss_type="mse")
+
+    # Simulate frozen features and raw images
+    features = {"vision": torch.randn(2, 768), "tactile": torch.randn(2, 768)}
+    raw_images = {"vision": torch.randn(2, 3, 224, 224), "tactile": torch.randn(2, 3, 224, 224)}
+
+    model.train()
+    output = model(features)
+
+    # Decode
+    recon_vision = decoder_vision(output["vision_all_tokens"])
+    recon_tactile = decoder_tactile(output["tactile_all_tokens"])
+    recons = {"vision": recon_vision, "tactile": recon_tactile}
+
+    losses = recon_loss_fn(recons, raw_images)
+    loss = losses["recon_total"]
+    loss.backward()
+
+    # Check gradients flow through decoder AND alignment model
+    decoder_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in decoder_vision.parameters())
+    model_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+    assert decoder_has_grad, "No gradients in decoder!"
+    assert model_has_grad, "No gradients in alignment model!"
+    print(f"  recon_loss: {loss.item():.4f}")
+    print(f"  decoder grads: OK")
+    print(f"  alignment model grads: OK")
+    print("  PASSED")
+
+
 def test_backward():
     print("Testing backward pass (end-to-end)...")
     model = CrossModalAlignmentModel(
@@ -185,6 +271,9 @@ if __name__ == "__main__":
     test_contrastive_loss()
     test_flow_matching()
     test_backward()
+    test_reconstruction_decoder()
+    test_reconstruction_loss()
+    test_reconstruction_backward()
     print("=" * 60)
     print("ALL TESTS PASSED")
     print("=" * 60)

@@ -161,6 +161,8 @@ class CrossModalAlignmentModel(nn.Module):
             output[f"{mod_name}_private"] = private_tokens
             output[f"{mod_name}_shared_tokens"] = shared_tokens
             output[f"{mod_name}_k_keep"] = k_keep
+            # All register tokens (for reconstruction decoder)
+            output[f"{mod_name}_all_tokens"] = torch.cat([shared_tokens, private_tokens], dim=1)
 
         output["logit_scale"] = self.logit_scale.exp()
         return output
