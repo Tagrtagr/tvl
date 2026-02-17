@@ -35,7 +35,11 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    HAS_TENSORBOARD = True
+except ImportError:
+    HAS_TENSORBOARD = False
 
 import yaml
 
@@ -448,7 +452,7 @@ def main(args):
     model_without_ddp = model
 
     # Logging
-    if global_rank == 0 and args.log_dir is not None:
+    if global_rank == 0 and args.log_dir is not None and HAS_TENSORBOARD:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.log_dir)
     else:
