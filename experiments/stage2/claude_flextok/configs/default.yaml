@@ -1,0 +1,64 @@
+# Stage 2: Cross-Modality Alignment with Register Tokens
+# Default configuration
+
+# ---- Model ----
+model:
+  hidden_dim: 512
+  n_registers: 32
+  n_shared: 8              # Registers for cross-modal alignment
+  n_layers: 4              # Transformer depth per modality
+  n_heads: 8
+  dropout: 0.1
+  nested_dropout: true
+  nested_dropout_mode: "power_of_two"
+
+# ---- Modalities ----
+modalities:
+  vision:
+    input_dim: 768          # OpenCLIP ViT-L-14
+    feature_type: "pooled"
+  tactile:
+    input_dim: 768          # ViT-Tiny/Small/Base (num_classes set to CLIP width)
+    feature_type: "pooled"
+
+# ---- Loss ----
+loss:
+  type: "contrastive"       # "contrastive", "flow_matching", or "combined"
+  contrastive_weight: 1.0
+  preservation_weight: 0.5
+  flow_matching_weight: 0.5
+  flow_hidden_dim: 1024
+  flow_n_layers: 3
+  flow_bidirectional: true
+  flow_timestep_sampling: "logit_normal"
+
+# ---- Training ----
+training:
+  epochs: 100
+  batch_size: 256
+  accum_iter: 1
+  base_lr: 3.0e-4
+  min_lr: 0.0
+  weight_decay: 0.05
+  warmup_epochs: 10
+  seed: 42
+
+# ---- Data ----
+data:
+  datasets:
+    - "ssvtp"
+    - "hct"
+  datasets_dir: "./.datasets"
+  num_workers: 10
+
+# ---- Stage 1 Checkpoint ----
+stage1:
+  tactile_model: "vit_tiny_patch16_224"
+  checkpoint: null           # Path to Stage 1 checkpoint
+  clip_vision_model: "ViT-L-14"
+  clip_pretrain_data: "datacomp_xl_s13b_b90k"
+
+# ---- Output ----
+output:
+  output_dir: "./output/stage2"
+  log_name: null
