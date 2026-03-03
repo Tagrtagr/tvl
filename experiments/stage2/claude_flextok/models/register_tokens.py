@@ -1,15 +1,21 @@
 """
-Register Token Module with Nested Dropout.
+Register Token Module with Nested Dropout and OAT-style Ordering.
 
-Adapted from FlexTok (Bachmann et al., 2025) for cross-modality alignment.
+Adapted from FlexTok (Bachmann et al., 2025) for cross-modality alignment,
+with insights from Ordered Action Tokenization (OAT) for enforcing
+coarse-to-fine information hierarchy in register tokens.
+
 Key ideas:
   - Learnable register tokens capture information at varying granularity
   - Causal attention among registers enforces coarse-to-fine ordering
   - Nested dropout ensures each prefix is a valid representation
+  - Token type embeddings signal role (shared vs private) — OAT-inspired
   - Tokens are split into "shared" (for cross-modal alignment) and
     "private" (for modality-specific information preservation)
 
-Reference: https://arxiv.org/abs/2502.13967
+References:
+  - FlexTok: https://arxiv.org/abs/2502.13967
+  - OAT: https://ordered-action-tokenization.github.io/
 """
 
 import math
@@ -54,6 +60,7 @@ class RegisterTokenModule(nn.Module):
         dropout: float = 0.1,
         nested_dropout: bool = True,
         nested_dropout_mode: str = "power_of_two",
+        use_token_type_embed: bool = True,
     ):
         super().__init__()
         assert n_shared <= n_registers, "n_shared must be <= n_registers"
@@ -68,6 +75,7 @@ class RegisterTokenModule(nn.Module):
         self.n_heads = n_heads
         self.nested_dropout = nested_dropout
         self.nested_dropout_mode = nested_dropout_mode
+        self.use_token_type_embed = use_token_type_embed
 
         # Project frozen encoder features to hidden_dim
         self.input_proj = nn.Linear(input_dim, hidden_dim)
@@ -81,6 +89,19 @@ class RegisterTokenModule(nn.Module):
         self.register_pos_embed = nn.Parameter(
             torch.randn(1, n_registers, hidden_dim) * 0.02
         )
+
+        # OAT-inspired token type embeddings to signal role (shared vs private).
+        # This helps the model learn to route cross-modal information to shared
+        # tokens and modality-specific information to private tokens.
+        if use_token_type_embed:
+            self.token_type_embed = nn.Parameter(
+                torch.randn(1, n_registers, hidden_dim) * 0.02
+            )
+            # Initialize: shared tokens get type 0, private tokens get type 1
+            # (they'll diverge during training but this seeds the distinction)
+            with torch.no_grad():
+                self.token_type_embed[:, :n_shared, :] *= 0.5
+                self.token_type_embed[:, n_shared:, :] *= -0.5
 
         # Transformer layers with custom attention masking
         self.layers = nn.ModuleList([
@@ -112,6 +133,8 @@ class RegisterTokenModule(nn.Module):
     def _init_weights(self):
         nn.init.trunc_normal_(self.register_tokens, std=0.02)
         nn.init.trunc_normal_(self.register_pos_embed, std=0.02)
+        if self.use_token_type_embed:
+            nn.init.trunc_normal_(self.token_type_embed, std=0.02)
         nn.init.xavier_uniform_(self.input_proj.weight)
         nn.init.zeros_(self.input_proj.bias)
 
@@ -171,6 +194,8 @@ class RegisterTokenModule(nn.Module):
 
         # Expand register tokens for the batch
         registers = self.register_tokens.expand(B, -1, -1) + self.register_pos_embed
+        if self.use_token_type_embed:
+            registers = registers + self.token_type_embed
 
         # Concatenate: [input_tokens, register_tokens]
         x = torch.cat([x_input, registers], dim=1)  # (B, N + n_reg, hidden_dim)

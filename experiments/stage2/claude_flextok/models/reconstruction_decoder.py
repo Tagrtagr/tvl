@@ -5,6 +5,10 @@ Takes ALL register tokens (shared + private) and decodes back to pixel space.
 This is the core FlexTok contribution: register tokens should be sufficient
 to reconstruct the original image/tactile input.
 
+Supports OAT-style prefix decoding: reconstruct using only the first K tokens
+(zero-padding the rest) to evaluate what information each token captures.
+See: Ordered Action Tokenization (https://ordered-action-tokenization.github.io/)
+
 Architecture:
     register_tokens (B, n_reg, hidden_dim)
     -> small transformer (self-attention among tokens)
@@ -135,6 +139,44 @@ class ReconstructionDecoder(nn.Module):
 
         # To pixels
         x = self.to_pixels(x)  # (B, 3, 224, 224)
+
+        return x
+
+    def forward_prefix(self, register_tokens: torch.Tensor, k: int) -> torch.Tensor:
+        """
+        OAT-style prefix decoding: reconstruct using only the first K tokens.
+
+        Following OAT's "anytime reconstruction" principle, earlier tokens should
+        capture global structure while later tokens refine details. By decoding
+        with only a prefix of tokens, we can evaluate this coarse-to-fine hierarchy.
+
+        Tokens beyond position k are zero-padded to maintain the expected input
+        shape for the spatial projection layer.
+
+        Args:
+            register_tokens: (B, n_registers, hidden_dim) all register tokens.
+            k: Number of prefix tokens to use (rest are zeroed).
+
+        Returns:
+            reconstruction: (B, output_channels, output_size, output_size)
+        """
+        B = register_tokens.shape[0]
+        k = min(k, self.n_registers)
+
+        # Zero-pad tokens beyond the prefix
+        tokens = register_tokens.clone()
+        if k < self.n_registers:
+            tokens[:, k:, :] = 0.0
+
+        # Standard forward from here
+        x = self.token_processor(tokens)
+        x = self.token_norm(x)
+        x = self.token_proj(x)
+        x = x.reshape(B, -1)
+        x = self.to_spatial(x)
+        x = x.reshape(B, self.base_channels, self.h0, self.w0)
+        x = self.upsample(x)
+        x = self.to_pixels(x)
 
         return x
 

@@ -14,7 +14,7 @@ from models.cross_modal_alignment import CrossModalAlignmentModel
 from losses.alignment_loss import CrossModalAlignmentLoss
 from losses.flow_matching import FlowMatchingAlignmentLoss
 from models.reconstruction_decoder import ReconstructionDecoder
-from losses.reconstruction_loss import ReconstructionLoss
+from losses.reconstruction_loss import ReconstructionLoss, PrefixReconstructionLoss
 
 
 def test_register_tokens():
@@ -262,17 +262,109 @@ def test_backward():
     print("  PASSED")
 
 
+def test_token_type_embeddings():
+    print("Testing RegisterTokenModule with OAT-style token type embeddings...")
+    module = RegisterTokenModule(
+        input_dim=768, hidden_dim=512, n_registers=16,
+        n_shared=4, n_layers=2, n_heads=8,
+        use_token_type_embed=True,
+    )
+    assert hasattr(module, "token_type_embed"), "Missing token_type_embed parameter"
+    assert module.token_type_embed.shape == (1, 16, 512)
+
+    x = torch.randn(4, 1, 768)
+    module.train()
+    shared, private, k_keep = module(x)
+    assert shared.shape == (4, 4, 512)
+    assert private.shape == (4, 12, 512)
+
+    # Test without token type embeddings
+    module_no_tte = RegisterTokenModule(
+        input_dim=768, hidden_dim=512, n_registers=16,
+        n_shared=4, n_layers=2, n_heads=8,
+        use_token_type_embed=False,
+    )
+    shared2, private2, _ = module_no_tte(x)
+    assert shared2.shape == (4, 4, 512)
+    print("  PASSED")
+
+
+def test_prefix_reconstruction():
+    print("Testing ReconstructionDecoder.forward_prefix (OAT-style)...")
+    decoder = ReconstructionDecoder(
+        n_registers=16, hidden_dim=256, base_channels=128,
+        n_decoder_layers=1, n_heads=4,
+    )
+
+    tokens = torch.randn(4, 16, 256)
+
+    # Full reconstruction
+    full_recon = decoder(tokens)
+    assert full_recon.shape == (4, 3, 224, 224)
+
+    # Prefix reconstruction at different K values
+    for k in [1, 2, 4, 8, 16]:
+        prefix_recon = decoder.forward_prefix(tokens, k=k)
+        assert prefix_recon.shape == (4, 3, 224, 224), f"k={k}: got {prefix_recon.shape}"
+
+    # Full prefix (k=n_registers) should be close to full forward
+    full_prefix = decoder.forward_prefix(tokens, k=16)
+    diff = (full_recon - full_prefix).abs().max().item()
+    print(f"  Full vs prefix(k=16) max diff: {diff:.6f}")
+
+    # Gradients should flow through prefix reconstruction
+    prefix_recon = decoder.forward_prefix(tokens, k=4)
+    prefix_recon.sum().backward()
+    has_grad = any(p.grad is not None for p in decoder.parameters())
+    assert has_grad, "No gradients through prefix forward!"
+    print("  PASSED")
+
+
+def test_prefix_reconstruction_loss():
+    print("Testing PrefixReconstructionLoss (OAT-style)...")
+    decoder_v = ReconstructionDecoder(
+        n_registers=16, hidden_dim=256, base_channels=64,
+        n_decoder_layers=1, n_heads=4,
+    )
+    decoder_t = ReconstructionDecoder(
+        n_registers=16, hidden_dim=256, base_channels=64,
+        n_decoder_layers=1, n_heads=4,
+    )
+    decoders = {"vision": decoder_v, "tactile": decoder_t}
+
+    loss_fn = PrefixReconstructionLoss(loss_type="mse", prefix_weight=0.5)
+
+    all_tokens = {
+        "vision": torch.randn(2, 16, 256),
+        "tactile": torch.randn(2, 16, 256),
+    }
+    targets = {
+        "vision": torch.randn(2, 3, 224, 224),
+        "tactile": torch.randn(2, 3, 224, 224),
+    }
+
+    losses = loss_fn(all_tokens, targets, decoders)
+    print(f"  recon_full_avg: {losses['recon_full_avg'].item():.4f}")
+    print(f"  recon_prefix_avg: {losses['recon_prefix_avg'].item():.4f}")
+    print(f"  recon_total: {losses['recon_total'].item():.4f}")
+    assert losses["recon_total"].item() > 0
+    print("  PASSED")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Stage 2 Module Tests")
     print("=" * 60)
     test_register_tokens()
+    test_token_type_embeddings()
     test_cross_modal_alignment()
     test_contrastive_loss()
     test_flow_matching()
     test_backward()
     test_reconstruction_decoder()
+    test_prefix_reconstruction()
     test_reconstruction_loss()
+    test_prefix_reconstruction_loss()
     test_reconstruction_backward()
     print("=" * 60)
     print("ALL TESTS PASSED")

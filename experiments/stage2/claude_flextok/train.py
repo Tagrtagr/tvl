@@ -63,7 +63,7 @@ from models.cross_modal_alignment import CrossModalAlignmentModel, Stage2Wrapper
 from models.reconstruction_decoder import ReconstructionDecoder
 from losses.alignment_loss import CrossModalAlignmentLoss
 from losses.flow_matching import FlowMatchingAlignmentLoss
-from losses.reconstruction_loss import ReconstructionLoss
+from losses.reconstruction_loss import ReconstructionLoss, PrefixReconstructionLoss
 
 try:
     import wandb
@@ -102,6 +102,17 @@ def get_args_parser():
     parser.add_argument("--recon_decoder_layers", type=int, default=2)
     parser.add_argument("--recon_loss_type", type=str, default="mse",
                         choices=["mse", "l1", "smooth_l1"])
+
+    # OAT-style prefix reconstruction (coarse-to-fine ordering)
+    parser.add_argument("--use_prefix_recon", action="store_true", default=False,
+                        help="Enable OAT-style prefix reconstruction loss")
+    parser.add_argument("--prefix_recon_weight", type=float, default=0.5,
+                        help="Weight for prefix reconstruction relative to full recon")
+
+    # Token type embeddings (OAT-inspired)
+    parser.add_argument("--use_token_type_embed", action="store_true", default=True,
+                        help="Enable OAT-style token type embeddings (shared vs private)")
+    parser.add_argument("--no_token_type_embed", action="store_false", dest="use_token_type_embed")
 
     # Training
     parser.add_argument("--batch_size", default=256, type=int)
@@ -235,6 +246,7 @@ def build_model(args, device):
     }
 
     # Build Stage 2 alignment model
+    use_token_type = getattr(args, "use_token_type_embed", True)
     alignment_model = CrossModalAlignmentModel(
         modality_configs=modality_configs,
         hidden_dim=args.hidden_dim,
@@ -245,6 +257,7 @@ def build_model(args, device):
         dropout=args.model_dropout,
         nested_dropout=args.nested_dropout,
         nested_dropout_mode=args.nested_dropout_mode,
+        use_token_type_embed=use_token_type,
     )
 
     # Wrap into Stage 2 pipeline
@@ -282,7 +295,7 @@ def _unwrap(model):
 def train_one_epoch(
     model, contrastive_loss_fn, flow_loss_fn, data_loader,
     optimizer, device, epoch, loss_scaler, args, log_writer=None,
-    recon_decoders=None, recon_loss_fn=None,
+    recon_decoders=None, recon_loss_fn=None, prefix_recon_loss_fn=None,
 ):
     model.train()
     # Keep frozen encoder in eval mode
@@ -352,6 +365,23 @@ def train_one_epoch(
                     for k, v in recon_dict.items():
                         if isinstance(v, torch.Tensor):
                             loss_dict[k] = v
+
+            # OAT-style prefix reconstruction loss (if enabled)
+            if prefix_recon_loss_fn is not None and recon_decoders is not None:
+                all_tokens = {}
+                targets_pf = {}
+                for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+                    all_tokens_key = f"{mod_name}_all_tokens"
+                    if all_tokens_key in alignment_output and mod_name in samples:
+                        all_tokens[mod_name] = alignment_output[all_tokens_key]
+                        targets_pf[mod_name] = samples[mod_name]
+                if all_tokens:
+                    prefix_dict = prefix_recon_loss_fn(all_tokens, targets_pf, recon_decoders)
+                    prefix_loss = prefix_dict["recon_total"]
+                    loss = loss + args.reconstruction_weight * prefix_loss
+                    for k, v in prefix_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            loss_dict[f"prefix_{k}"] = v
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -519,6 +549,7 @@ def main(args):
     # Build reconstruction decoders (if enabled)
     recon_decoders = None
     recon_loss_fn = None
+    prefix_recon_loss_fn = None
     if args.use_reconstruction:
         recon_decoders = {}
         for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
@@ -535,6 +566,16 @@ def main(args):
             for dec in recon_decoders.values()
         )
         print(f"Reconstruction decoders: {n_decoder_params:,} parameters ({len(recon_decoders)} modalities)")
+
+        # OAT-style prefix reconstruction loss
+        use_prefix = getattr(args, "use_prefix_recon", False)
+        if use_prefix:
+            prefix_weight = getattr(args, "prefix_recon_weight", 0.5)
+            prefix_recon_loss_fn = PrefixReconstructionLoss(
+                loss_type=args.recon_loss_type,
+                prefix_weight=prefix_weight,
+            )
+            print(f"OAT-style prefix reconstruction enabled (weight={prefix_weight})")
 
     # Logging
     if global_rank == 0 and args.log_dir is not None and HAS_TENSORBOARD:
@@ -609,6 +650,7 @@ def main(args):
             model, contrastive_loss_fn, flow_loss_fn, data_loader_train,
             optimizer, device, epoch, loss_scaler, args, log_writer=log_writer,
             recon_decoders=recon_decoders, recon_loss_fn=recon_loss_fn,
+            prefix_recon_loss_fn=prefix_recon_loss_fn,
         )
 
         val_stats = evaluate(data_loader_val, contrastive_loss_fn, model, device,
