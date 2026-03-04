@@ -2,19 +2,39 @@
 Stage 2 Training Script: Cross-Modality Alignment with Register Tokens.
 Approach: FlexTok-inspired register tokens (Claude Code)
 
-Trains learnable register token modules on top of frozen Stage-1 encoders
-to align vision and tactile representations in a shared latent space.
+Supports two-stage training following FlexTok (Bachmann et al., 2025):
+  Stage 2a ("alignment"): Train register tokens with contrastive + preservation loss.
+  Stage 2b ("reconstruction"): Freeze register tokens, train autoregressive decoder only.
+  "joint" mode trains both together (legacy behavior).
 
 Usage:
-    # Single GPU
+    # Stage 2a: Train alignment (register tokens only, no decoder)
     python experiments/stage2/claude_flextok/train.py \
-        --stage1_checkpoint /path/to/stage1/checkpoint.pth \
+        --stage alignment \
+        --stage1_checkpoint /path/to/stage1.pth \
         --datasets_dir /path/to/datasets \
-        --output_dir ./output/stage2
+        --output_dir ./output/stage2a
+
+    # Stage 2b: Train reconstruction decoder (frozen alignment model)
+    python experiments/stage2/claude_flextok/train.py \
+        --stage reconstruction \
+        --alignment_checkpoint ./output/stage2a/checkpoint_best.pth \
+        --stage1_checkpoint /path/to/stage1.pth \
+        --datasets_dir /path/to/datasets \
+        --decoder_type autoregressive \
+        --output_dir ./output/stage2b
+
+    # Joint training (legacy, both together)
+    python experiments/stage2/claude_flextok/train.py \
+        --stage1_checkpoint /path/to/stage1.pth \
+        --datasets_dir /path/to/datasets \
+        --use_reconstruction --decoder_type autoregressive \
+        --output_dir ./output/stage2_joint
 
     # Multi-GPU (DDP)
     torchrun --nproc_per_node=4 experiments/stage2/claude_flextok/train.py \
-        --stage1_checkpoint /path/to/stage1/checkpoint.pth \
+        --stage alignment \
+        --stage1_checkpoint /path/to/stage1.pth \
         --datasets_dir /path/to/datasets
 """
 
@@ -61,6 +81,7 @@ from tvl_enc.tacvis import (
 
 from models.cross_modal_alignment import CrossModalAlignmentModel, Stage2Wrapper
 from models.reconstruction_decoder import ReconstructionDecoder
+from models.autoregressive_decoder import AutoregressiveDecoder
 from losses.alignment_loss import CrossModalAlignmentLoss
 from losses.flow_matching import FlowMatchingAlignmentLoss
 from losses.reconstruction_loss import ReconstructionLoss, PrefixReconstructionLoss
@@ -113,6 +134,18 @@ def get_args_parser():
     parser.add_argument("--use_token_type_embed", action="store_true", default=True,
                         help="Enable OAT-style token type embeddings (shared vs private)")
     parser.add_argument("--no_token_type_embed", action="store_false", dest="use_token_type_embed")
+
+    # Training stage (FlexTok two-stage split)
+    parser.add_argument("--stage", type=str, default="joint",
+                        choices=["alignment", "reconstruction", "joint"],
+                        help="Training stage: 'alignment' trains register tokens only, "
+                             "'reconstruction' freezes alignment and trains decoder only, "
+                             "'joint' trains both together (legacy)")
+    parser.add_argument("--alignment_checkpoint", type=str, default=None,
+                        help="Path to alignment stage checkpoint (for --stage reconstruction)")
+    parser.add_argument("--decoder_type", type=str, default="autoregressive",
+                        choices=["conv", "autoregressive"],
+                        help="Reconstruction decoder: 'autoregressive' (transformer) or 'conv' (ConvTranspose)")
 
     # Training
     parser.add_argument("--batch_size", default=256, type=int)
@@ -324,64 +357,77 @@ def train_one_epoch(
                 v = v[0]
             samples[k] = v.to(device, non_blocking=True).squeeze()
 
+        stage = getattr(args, "stage", "joint")
+
         with torch.cuda.amp.autocast():
-            # Get frozen features
+            # Get frozen encoder features
             with torch.no_grad():
                 frozen_features = model_inner.encode(samples)
 
             # Forward through alignment model
-            alignment_output = model_inner.alignment_model(frozen_features)
+            # In reconstruction stage, alignment is frozen — skip graph building
+            if stage == "reconstruction":
+                with torch.no_grad():
+                    alignment_output = model_inner.alignment_model(frozen_features)
+            else:
+                alignment_output = model_inner.alignment_model(frozen_features)
 
-            # Contrastive + preservation loss
-            preservation_projectors = model_inner.alignment_model.preservation_projectors
-            loss_dict = contrastive_loss_fn(
-                alignment_output,
-                frozen_features=frozen_features,
-                preservation_projectors=preservation_projectors,
-                output_dict=True,
-            )
-            loss = loss_dict["total_loss"]
+            loss = torch.tensor(0.0, device=device)
+            loss_dict = {}
 
-            # Flow matching loss (if enabled)
-            if flow_loss_fn is not None:
-                flow_dict = flow_loss_fn(alignment_output, output_dict=True)
-                flow_loss = flow_dict.get("flow_total", torch.tensor(0.0, device=device))
-                loss = loss + args.flow_weight * flow_loss
-                loss_dict["flow_loss"] = flow_loss
+            # Contrastive + preservation loss (alignment and joint stages)
+            if stage != "reconstruction":
+                preservation_projectors = model_inner.alignment_model.preservation_projectors
+                align_dict = contrastive_loss_fn(
+                    alignment_output,
+                    frozen_features=frozen_features,
+                    preservation_projectors=preservation_projectors,
+                    output_dict=True,
+                )
+                loss = align_dict["total_loss"]
+                loss_dict.update(align_dict)
 
-            # Reconstruction loss (if enabled)
-            if recon_decoders is not None and recon_loss_fn is not None:
-                recons = {}
-                targets = {}
-                for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-                    all_tokens_key = f"{mod_name}_all_tokens"
-                    if all_tokens_key in alignment_output and mod_name in samples:
-                        recons[mod_name] = recon_decoders[mod_name](alignment_output[all_tokens_key])
-                        targets[mod_name] = samples[mod_name]
-                if recons:
-                    recon_dict = recon_loss_fn(recons, targets)
-                    recon_loss = recon_dict["recon_total"]
-                    loss = loss + args.reconstruction_weight * recon_loss
-                    for k, v in recon_dict.items():
-                        if isinstance(v, torch.Tensor):
-                            loss_dict[k] = v
+                # Flow matching loss (if enabled)
+                if flow_loss_fn is not None:
+                    flow_dict = flow_loss_fn(alignment_output, output_dict=True)
+                    flow_loss = flow_dict.get("flow_total", torch.tensor(0.0, device=device))
+                    loss = loss + args.flow_weight * flow_loss
+                    loss_dict["flow_loss"] = flow_loss
 
-            # OAT-style prefix reconstruction loss (if enabled)
-            if prefix_recon_loss_fn is not None and recon_decoders is not None:
-                all_tokens = {}
-                targets_pf = {}
-                for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-                    all_tokens_key = f"{mod_name}_all_tokens"
-                    if all_tokens_key in alignment_output and mod_name in samples:
-                        all_tokens[mod_name] = alignment_output[all_tokens_key]
-                        targets_pf[mod_name] = samples[mod_name]
-                if all_tokens:
-                    prefix_dict = prefix_recon_loss_fn(all_tokens, targets_pf, recon_decoders)
-                    prefix_loss = prefix_dict["recon_total"]
-                    loss = loss + args.reconstruction_weight * prefix_loss
-                    for k, v in prefix_dict.items():
-                        if isinstance(v, torch.Tensor):
-                            loss_dict[f"prefix_{k}"] = v
+            # Reconstruction loss (reconstruction and joint stages)
+            if stage != "alignment":
+                if recon_decoders is not None and recon_loss_fn is not None:
+                    recons = {}
+                    targets = {}
+                    for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+                        all_tokens_key = f"{mod_name}_all_tokens"
+                        if all_tokens_key in alignment_output and mod_name in samples:
+                            recons[mod_name] = recon_decoders[mod_name](alignment_output[all_tokens_key])
+                            targets[mod_name] = samples[mod_name]
+                    if recons:
+                        recon_dict = recon_loss_fn(recons, targets)
+                        recon_loss = recon_dict["recon_total"]
+                        loss = loss + args.reconstruction_weight * recon_loss
+                        for k, v in recon_dict.items():
+                            if isinstance(v, torch.Tensor):
+                                loss_dict[k] = v
+
+                # OAT-style prefix reconstruction loss (if enabled)
+                if prefix_recon_loss_fn is not None and recon_decoders is not None:
+                    all_tokens = {}
+                    targets_pf = {}
+                    for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+                        all_tokens_key = f"{mod_name}_all_tokens"
+                        if all_tokens_key in alignment_output and mod_name in samples:
+                            all_tokens[mod_name] = alignment_output[all_tokens_key]
+                            targets_pf[mod_name] = samples[mod_name]
+                    if all_tokens:
+                        prefix_dict = prefix_recon_loss_fn(all_tokens, targets_pf, recon_decoders)
+                        prefix_loss = prefix_dict["recon_total"]
+                        loss = loss + args.reconstruction_weight * prefix_loss
+                        for k, v in prefix_dict.items():
+                            if isinstance(v, torch.Tensor):
+                                loss_dict[f"prefix_{k}"] = v
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -390,13 +436,14 @@ def train_one_epoch(
 
         loss /= accum_iter
 
-        # Collect trainable parameters
+        # Collect trainable parameters (filtered by requires_grad for stage support)
         trainable_params = list(model_inner.alignment_model.parameters())
         if flow_loss_fn is not None:
             trainable_params += list(flow_loss_fn.parameters())
         if recon_decoders is not None:
             for dec in recon_decoders.values():
                 trainable_params += list(dec.parameters())
+        trainable_params = [p for p in trainable_params if p.requires_grad]
 
         loss_scaler(loss, optimizer, parameters=trainable_params,
                     update_grad=(data_iter_step + 1) % accum_iter == 0)
@@ -546,20 +593,50 @@ def main(args):
     model = build_model(args, device)
     model_without_ddp = model
 
+    # --- Training stage handling ---
+    stage = getattr(args, "stage", "joint")
+    if stage == "reconstruction":
+        # Load and freeze alignment model for decoder-only training
+        if args.alignment_checkpoint and os.path.exists(args.alignment_checkpoint):
+            print(f"Loading alignment checkpoint: {args.alignment_checkpoint}")
+            align_ckpt = torch.load(args.alignment_checkpoint, map_location="cpu")
+            model_without_ddp.alignment_model.load_state_dict(
+                align_ckpt.get("alignment_model", {}), strict=False,
+            )
+        for p in model_without_ddp.alignment_model.parameters():
+            p.requires_grad = False
+        n_frozen = sum(p.numel() for p in model_without_ddp.alignment_model.parameters())
+        print(f"Froze alignment model ({n_frozen:,} params) for reconstruction stage")
+        args.use_reconstruction = True
+    elif stage == "alignment":
+        args.use_reconstruction = False
+        print("Alignment stage: reconstruction disabled")
+
     # Build reconstruction decoders (if enabled)
     recon_decoders = None
     recon_loss_fn = None
     prefix_recon_loss_fn = None
     if args.use_reconstruction:
         recon_decoders = {}
-        for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-            recon_decoders[mod_name] = ReconstructionDecoder(
-                n_registers=args.n_registers,
-                hidden_dim=args.hidden_dim,
-                base_channels=args.recon_base_channels,
-                n_decoder_layers=args.recon_decoder_layers,
-                n_heads=args.n_heads,
-            ).to(device)
+        decoder_type = getattr(args, "decoder_type", "autoregressive")
+        if decoder_type == "autoregressive":
+            for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+                recon_decoders[mod_name] = AutoregressiveDecoder(
+                    n_registers=args.n_registers,
+                    hidden_dim=args.hidden_dim,
+                    base_channels=args.recon_base_channels,
+                    n_decoder_layers=args.recon_decoder_layers,
+                    n_heads=args.n_heads,
+                ).to(device)
+        else:
+            for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+                recon_decoders[mod_name] = ReconstructionDecoder(
+                    n_registers=args.n_registers,
+                    hidden_dim=args.hidden_dim,
+                    base_channels=args.recon_base_channels,
+                    n_decoder_layers=args.recon_decoder_layers,
+                    n_heads=args.n_heads,
+                ).to(device)
         recon_loss_fn = ReconstructionLoss(loss_type=args.recon_loss_type)
         n_decoder_params = sum(
             sum(p.numel() for p in dec.parameters())
@@ -596,16 +673,19 @@ def main(args):
         )
         model_without_ddp = model.module
 
-    # Optimizer (only optimize Stage 2 parameters)
-    alignment_params = list(model_without_ddp.alignment_model.parameters())
-
     # Build loss
     contrastive_loss_fn, flow_loss_fn = build_loss(args, device)
-    if flow_loss_fn is not None:
-        alignment_params += list(flow_loss_fn.parameters())
-    if recon_decoders is not None:
+
+    # Optimizer: collect trainable parameters based on stage
+    trainable_params = []
+    if stage != "reconstruction":
+        trainable_params += list(model_without_ddp.alignment_model.parameters())
+        if flow_loss_fn is not None:
+            trainable_params += list(flow_loss_fn.parameters())
+    if stage != "alignment" and recon_decoders is not None:
         for dec in recon_decoders.values():
-            alignment_params += list(dec.parameters())
+            trainable_params += list(dec.parameters())
+    trainable_params = [p for p in trainable_params if p.requires_grad]
 
     # Effective batch size for LR scaling
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
@@ -616,7 +696,10 @@ def main(args):
     print(f"actual lr: {args.lr:.2e}")
     print(f"effective batch size: {eff_batch_size}")
 
-    optimizer = torch.optim.AdamW(alignment_params, lr=args.lr, betas=(0.9, 0.95),
+    n_opt_params = sum(p.numel() for p in trainable_params)
+    print(f"Optimizing {n_opt_params:,} parameters (stage={stage})")
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, betas=(0.9, 0.95),
                                    weight_decay=args.weight_decay)
     loss_scaler = NativeScaler()
 
@@ -624,7 +707,9 @@ def main(args):
     if args.resume and os.path.exists(args.resume):
         print(f"Resuming from {args.resume}")
         ckpt = torch.load(args.resume, map_location="cpu")
-        model_without_ddp.alignment_model.load_state_dict(ckpt.get("alignment_model", {}), strict=False)
+        # In reconstruction stage, alignment model is already loaded and frozen
+        if stage != "reconstruction":
+            model_without_ddp.alignment_model.load_state_dict(ckpt.get("alignment_model", {}), strict=False)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scaler" in ckpt:
@@ -641,6 +726,7 @@ def main(args):
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     best_acc1 = 0.0
+    best_recon_loss = float("inf")
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -659,7 +745,11 @@ def main(args):
                              args=args)
 
         acc1 = val_stats.get("acc1", 0.0)
-        print(f"Epoch {epoch}: val_loss={val_stats.get('loss', 0):.4f}, val_acc1={acc1:.1f}%")
+        recon_loss_val = val_stats.get("recon_total", val_stats.get("recon_pixel_avg", float("inf")))
+        if stage == "reconstruction":
+            print(f"Epoch {epoch}: val_recon_loss={recon_loss_val:.6f}")
+        else:
+            print(f"Epoch {epoch}: val_loss={val_stats.get('loss', 0):.4f}, val_acc1={acc1:.1f}%")
 
         # Save checkpoint
         if args.output_dir:
@@ -676,10 +766,20 @@ def main(args):
                 for mod_name, dec in recon_decoders.items():
                     save_dict[f"recon_decoder_{mod_name}"] = dec.state_dict()
 
-            if acc1 > best_acc1:
-                best_acc1 = acc1
-                if misc.is_main_process():
-                    torch.save(save_dict, os.path.join(args.output_dir, "checkpoint_best.pth"))
+            # In reconstruction stage, track best by recon loss (lower is better)
+            # Otherwise track best by accuracy (higher is better)
+            is_best = False
+            if stage == "reconstruction":
+                if recon_loss_val < best_recon_loss:
+                    best_recon_loss = recon_loss_val
+                    is_best = True
+            else:
+                if acc1 > best_acc1:
+                    best_acc1 = acc1
+                    is_best = True
+
+            if is_best and misc.is_main_process():
+                torch.save(save_dict, os.path.join(args.output_dir, "checkpoint_best.pth"))
 
             if misc.is_main_process():
                 torch.save(save_dict, os.path.join(args.output_dir, "checkpoint_latest.pth"))

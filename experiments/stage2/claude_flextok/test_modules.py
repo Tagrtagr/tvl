@@ -14,6 +14,7 @@ from models.cross_modal_alignment import CrossModalAlignmentModel
 from losses.alignment_loss import CrossModalAlignmentLoss
 from losses.flow_matching import FlowMatchingAlignmentLoss
 from models.reconstruction_decoder import ReconstructionDecoder
+from models.autoregressive_decoder import AutoregressiveDecoder
 from losses.reconstruction_loss import ReconstructionLoss, PrefixReconstructionLoss
 
 
@@ -320,6 +321,85 @@ def test_prefix_reconstruction():
     print("  PASSED")
 
 
+def test_autoregressive_decoder():
+    print("Testing AutoregressiveDecoder...")
+    decoder = AutoregressiveDecoder(
+        n_registers=16, hidden_dim=256, n_spatial=49,  # 7x7
+        base_channels=64, n_decoder_layers=2, n_heads=4,
+    )
+
+    tokens = torch.randn(4, 16, 256)
+    recon = decoder(tokens)
+    print(f"  input: {tokens.shape}")
+    print(f"  output: {recon.shape}")
+    assert recon.shape == (4, 3, 224, 224), f"Expected (4, 3, 224, 224), got {recon.shape}"
+
+    # Check gradients flow
+    recon.sum().backward()
+    has_grad = any(p.grad is not None for p in decoder.parameters())
+    assert has_grad, "No gradients in autoregressive decoder!"
+    print(f"  params: {sum(p.numel() for p in decoder.parameters()):,}")
+
+    # Test prefix decoding (cross-attention handles variable-length memory)
+    decoder.zero_grad()
+    for k in [1, 2, 4, 8, 16]:
+        prefix_recon = decoder.forward_prefix(tokens, k=k)
+        assert prefix_recon.shape == (4, 3, 224, 224), f"k={k}: got {prefix_recon.shape}"
+
+    # Prefix with all tokens should match full forward
+    decoder.eval()
+    with torch.no_grad():
+        full = decoder(tokens)
+        full_prefix = decoder.forward_prefix(tokens, k=16)
+    diff = (full - full_prefix).abs().max().item()
+    print(f"  Full vs prefix(k=16) max diff: {diff:.6f}")
+    assert diff < 1e-4, f"Full and prefix(k=all) should match, got diff={diff}"
+
+    # Gradients through prefix
+    decoder.train()
+    decoder.zero_grad()
+    prefix_recon = decoder.forward_prefix(tokens, k=4)
+    prefix_recon.sum().backward()
+    has_grad = any(p.grad is not None for p in decoder.parameters())
+    assert has_grad, "No gradients through prefix forward!"
+    print("  PASSED")
+
+
+def test_autoregressive_decoder_backward():
+    print("Testing autoregressive decoder end-to-end backward...")
+    model = CrossModalAlignmentModel(
+        modality_configs={
+            "vision": {"input_dim": 768, "feature_type": "pooled"},
+            "tactile": {"input_dim": 768, "feature_type": "pooled"},
+        },
+        hidden_dim=256, n_registers=16, n_shared=4,
+        n_layers=2, n_heads=4,
+    )
+    decoder = AutoregressiveDecoder(
+        n_registers=16, hidden_dim=256, n_spatial=49,
+        base_channels=64, n_decoder_layers=2, n_heads=4,
+    )
+    recon_loss_fn = ReconstructionLoss(loss_type="mse")
+
+    features = {"vision": torch.randn(2, 768), "tactile": torch.randn(2, 768)}
+    raw_images = {"vision": torch.randn(2, 3, 224, 224)}
+
+    model.train()
+    output = model(features)
+    recon = decoder(output["vision_all_tokens"])
+    losses = recon_loss_fn({"vision": recon}, raw_images)
+    loss = losses["recon_total"]
+    loss.backward()
+
+    decoder_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in decoder.parameters())
+    model_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+    assert decoder_has_grad, "No gradients in autoregressive decoder!"
+    assert model_has_grad, "No gradients in alignment model!"
+    print(f"  recon_loss: {loss.item():.4f}")
+    print(f"  decoder grads: OK, alignment model grads: OK")
+    print("  PASSED")
+
+
 def test_prefix_reconstruction_loss():
     print("Testing PrefixReconstructionLoss (OAT-style)...")
     decoder_v = ReconstructionDecoder(
@@ -362,10 +442,12 @@ if __name__ == "__main__":
     test_flow_matching()
     test_backward()
     test_reconstruction_decoder()
+    test_autoregressive_decoder()
     test_prefix_reconstruction()
     test_reconstruction_loss()
     test_prefix_reconstruction_loss()
     test_reconstruction_backward()
+    test_autoregressive_decoder_backward()
     print("=" * 60)
     print("ALL TESTS PASSED")
     print("=" * 60)
