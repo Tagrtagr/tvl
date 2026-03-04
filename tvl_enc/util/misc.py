@@ -233,6 +233,26 @@ def init_distributed_mode(args):
     elif 'SLURM_PROCID' in os.environ:
         args.rank = int(os.environ['SLURM_PROCID'])
         args.gpu = args.rank % torch.cuda.device_count()
+        # For single-task SLURM jobs (e.g. srun with 1 GPU), skip distributed
+        ntasks = int(os.environ.get('SLURM_NTASKS', 1))
+        if ntasks == 1:
+            print('Single-task SLURM job detected, not using distributed mode')
+            setup_for_distributed(is_master=True)
+            args.distributed = False
+            return
+        args.world_size = ntasks
+        # Set MASTER_ADDR/PORT for multi-task SLURM if not already set
+        if 'MASTER_ADDR' not in os.environ:
+            import subprocess
+            node_list = os.environ.get('SLURM_NODELIST', 'localhost')
+            try:
+                result = subprocess.run(['scontrol', 'show', 'hostnames', node_list],
+                                        capture_output=True, text=True)
+                os.environ['MASTER_ADDR'] = result.stdout.strip().split('\n')[0]
+            except Exception:
+                os.environ['MASTER_ADDR'] = 'localhost'
+        if 'MASTER_PORT' not in os.environ:
+            os.environ['MASTER_PORT'] = '29500'
     else:
         print('Not using distributed mode')
         setup_for_distributed(is_master=True)  # hack
