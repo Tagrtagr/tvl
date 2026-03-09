@@ -8,6 +8,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/stage2a_%j.out
 #SBATCH --error=logs/stage2a_%j.err
+#SBATCH --chdir=/home/taarush/tvl
 
 # =============================================================================
 # Stage 2a: Alignment Training (Register Tokens)
@@ -43,7 +44,7 @@ if [ ! -d "$DATASETS_DIR/ssvtp" ]; then
 fi
 
 # ---- Setup ----
-cd "$(dirname "$0")/../../../.."  # cd to repo root
+# SBATCH --chdir sets working directory to repo root
 mkdir -p "$OUTPUT_DIR" logs
 
 echo "========================================="
