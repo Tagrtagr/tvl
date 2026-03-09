@@ -49,7 +49,7 @@ python experiments/stage2/claude_flextok/train.py \
     --stage1_checkpoint "$STAGE1_CKPT" \
     --tactile_model vit_tiny_patch16_224 \
     --datasets_dir "$DATASETS_DIR" \
-    --datasets ssvtp hct \
+    --datasets ssvtp \
     --output_dir "$OUTPUT_DIR" \
     --log_name "$LOG_NAME" \
     --decoder_type autoregressive \
