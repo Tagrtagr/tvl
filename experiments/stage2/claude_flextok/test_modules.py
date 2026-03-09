@@ -40,7 +40,7 @@ def test_register_tokens():
     module.eval()
     shared, private, k_keep = module(x)
     print(f"  [eval]  shared: {shared.shape}, private: {private.shape}, k_keep: {k_keep}")
-    assert k_keep == 16
+    assert k_keep == 4  # n_shared (nested dropout only applies to shared tokens)
     print("  PASSED")
 
 

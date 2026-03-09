@@ -115,18 +115,20 @@ class RegisterTokenModule(nn.Module):
 
         self.norm = nn.LayerNorm(hidden_dim)
 
-        # Pre-compute valid K_keep values for nested dropout
+        # Pre-compute valid K_keep values for nested dropout on SHARED tokens only.
+        # Previously this operated on all n_registers, causing resource contention:
+        # when k_keep < n_shared, private tokens were always zeroed (67% of steps),
+        # starving the preservation loss of gradients.
         if nested_dropout_mode == "power_of_two":
-            # {1, 2, 4, 8, ..., n_registers} intersected with powers of 2
-            self._k_keep_values = []
+            self._k_keep_shared_values = []
             k = 1
-            while k <= n_registers:
-                self._k_keep_values.append(k)
+            while k <= n_shared:
+                self._k_keep_shared_values.append(k)
                 k *= 2
-            if self._k_keep_values[-1] != n_registers:
-                self._k_keep_values.append(n_registers)
+            if self._k_keep_shared_values[-1] != n_shared:
+                self._k_keep_shared_values.append(n_shared)
         else:
-            self._k_keep_values = list(range(1, n_registers + 1))
+            self._k_keep_shared_values = list(range(1, n_shared + 1))
 
         self._init_weights()
 
@@ -165,10 +167,10 @@ class RegisterTokenModule(nn.Module):
 
         return mask
 
-    def _sample_k_keep(self) -> int:
-        """Sample number of register tokens to keep during nested dropout."""
-        idx = torch.randint(0, len(self._k_keep_values), (1,)).item()
-        return self._k_keep_values[idx]
+    def _sample_k_keep_shared(self) -> int:
+        """Sample number of shared register tokens to keep during nested dropout."""
+        idx = torch.randint(0, len(self._k_keep_shared_values), (1,)).item()
+        return self._k_keep_shared_values[idx]
 
     def forward(
         self,
@@ -184,7 +186,7 @@ class RegisterTokenModule(nn.Module):
         Returns:
             shared_tokens: (B, n_shared, hidden_dim) - for cross-modal contrastive alignment
             private_tokens: (B, n_private, hidden_dim) - modality-specific preservation
-            k_keep: Number of tokens kept (n_registers if no dropout applied)
+            k_keep: Number of shared tokens kept (n_shared if no dropout applied)
         """
         B, N, _ = encoder_features.shape
         device = encoder_features.device
@@ -212,20 +214,23 @@ class RegisterTokenModule(nn.Module):
         # Extract only register tokens (discard input tokens)
         register_out = x[:, N:, :]  # (B, n_registers, hidden_dim)
 
-        # Apply nested dropout
-        use_dropout = apply_nested_dropout if apply_nested_dropout is not None else (self.nested_dropout and self.training)
-        if use_dropout:
-            k_keep = self._sample_k_keep()
-            # Zero out tokens beyond k_keep
-            if k_keep < self.n_registers:
-                register_out = register_out.clone()
-                register_out[:, k_keep:, :] = 0.0
-        else:
-            k_keep = self.n_registers
-
-        # Split into shared and private
+        # Split into shared and private BEFORE nested dropout
+        # This prevents resource contention: nested dropout should only affect
+        # shared tokens (coarse-to-fine hierarchy for contrastive alignment),
+        # not private tokens (which need stable gradients for preservation loss).
         shared_tokens = register_out[:, :self.n_shared, :]
         private_tokens = register_out[:, self.n_shared:, :]
+
+        # Apply nested dropout only to shared tokens
+        use_dropout = apply_nested_dropout if apply_nested_dropout is not None else (self.nested_dropout and self.training)
+        if use_dropout:
+            k_keep = self._sample_k_keep_shared()
+            # Zero out shared tokens beyond k_keep
+            if k_keep < self.n_shared:
+                shared_tokens = shared_tokens.clone()
+                shared_tokens[:, k_keep:, :] = 0.0
+        else:
+            k_keep = self.n_shared
 
         return shared_tokens, private_tokens, k_keep
 

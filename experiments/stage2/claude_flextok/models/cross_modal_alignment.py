@@ -154,8 +154,12 @@ class CrossModalAlignmentModel(nn.Module):
 
             shared_tokens, private_tokens, k_keep = self.register_modules[mod_name](features)
 
-            # Pool shared tokens -> single vector, then project and normalize
-            shared_pooled = shared_tokens.mean(dim=1)  # (B, hidden_dim)
+            # Pool only non-zeroed shared tokens to avoid dilution from nested dropout.
+            # k_keep indicates how many shared tokens are active (rest are zeroed).
+            if k_keep < shared_tokens.shape[1]:
+                shared_pooled = shared_tokens[:, :k_keep, :].mean(dim=1)
+            else:
+                shared_pooled = shared_tokens.mean(dim=1)  # (B, hidden_dim)
             shared_proj = self.shared_projectors[mod_name](shared_pooled)
             shared_proj = F.normalize(shared_proj, dim=-1)
 
