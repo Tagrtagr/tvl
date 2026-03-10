@@ -150,28 +150,36 @@ class ReconstructionDecoder(nn.Module):
         capture global structure while later tokens refine details. By decoding
         with only a prefix of tokens, we can evaluate this coarse-to-fine hierarchy.
 
-        Tokens beyond position k are zero-padded to maintain the expected input
-        shape for the spatial projection layer.
+        Only the first K tokens are processed through self-attention; suffix
+        positions are excluded via a padding mask and then zeroed before the
+        spatial projection to ensure they contribute nothing to the output.
 
         Args:
             register_tokens: (B, n_registers, hidden_dim) all register tokens.
-            k: Number of prefix tokens to use (rest are zeroed).
+            k: Number of prefix tokens to use (rest are masked and zeroed).
 
         Returns:
             reconstruction: (B, output_channels, output_size, output_size)
         """
         B = register_tokens.shape[0]
-        k = min(k, self.n_registers)
+        k = max(0, min(k, self.n_registers))
 
-        # Zero-pad tokens beyond the prefix
-        tokens = register_tokens.clone()
-        if k < self.n_registers:
-            tokens[:, k:, :] = 0.0
+        # Build padding mask: True = ignore. Shape (B, n_registers).
+        mask = torch.ones(B, self.n_registers, dtype=torch.bool,
+                          device=register_tokens.device)
+        if k > 0:
+            mask[:, :k] = False  # keep first k tokens
 
-        # Standard forward from here
-        x = self.token_processor(tokens)
+        # Process with attention mask so suffix tokens don't participate
+        x = self.token_processor(register_tokens, src_key_padding_mask=mask)
         x = self.token_norm(x)
         x = self.token_proj(x)
+
+        # Zero out suffix positions after projection to remove any residual
+        # bias-term activations from masked positions
+        if k < self.n_registers:
+            x[:, k:, :] = 0.0
+
         x = x.reshape(B, -1)
         x = self.to_spatial(x)
         x = x.reshape(B, self.base_channels, self.h0, self.w0)
