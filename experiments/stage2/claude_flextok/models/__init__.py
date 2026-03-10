@@ -1,2 +1,3 @@
 from .register_tokens import RegisterTokenModule
 from .cross_modal_alignment import CrossModalAlignmentModel
+from .autoregressive_decoder import AutoregressiveDecoder

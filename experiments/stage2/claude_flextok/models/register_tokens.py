@@ -1,15 +1,21 @@
 """
-Register Token Module with Nested Dropout.
+Register Token Module with Nested Dropout and OAT-style Ordering.
 
-Adapted from FlexTok (Bachmann et al., 2025) for cross-modality alignment.
+Adapted from FlexTok (Bachmann et al., 2025) for cross-modality alignment,
+with insights from Ordered Action Tokenization (OAT) for enforcing
+coarse-to-fine information hierarchy in register tokens.
+
 Key ideas:
   - Learnable register tokens capture information at varying granularity
   - Causal attention among registers enforces coarse-to-fine ordering
   - Nested dropout ensures each prefix is a valid representation
+  - Token type embeddings signal role (shared vs private) — OAT-inspired
   - Tokens are split into "shared" (for cross-modal alignment) and
     "private" (for modality-specific information preservation)
 
-Reference: https://arxiv.org/abs/2502.13967
+References:
+  - FlexTok: https://arxiv.org/abs/2502.13967
+  - OAT: https://ordered-action-tokenization.github.io/
 """
 
 import math
@@ -54,6 +60,7 @@ class RegisterTokenModule(nn.Module):
         dropout: float = 0.1,
         nested_dropout: bool = True,
         nested_dropout_mode: str = "power_of_two",
+        use_token_type_embed: bool = True,
     ):
         super().__init__()
         assert n_shared <= n_registers, "n_shared must be <= n_registers"
@@ -68,6 +75,7 @@ class RegisterTokenModule(nn.Module):
         self.n_heads = n_heads
         self.nested_dropout = nested_dropout
         self.nested_dropout_mode = nested_dropout_mode
+        self.use_token_type_embed = use_token_type_embed
 
         # Project frozen encoder features to hidden_dim
         self.input_proj = nn.Linear(input_dim, hidden_dim)
@@ -82,6 +90,14 @@ class RegisterTokenModule(nn.Module):
             torch.randn(1, n_registers, hidden_dim) * 0.02
         )
 
+        # OAT-inspired token type embeddings to signal role (shared vs private).
+        # This helps the model learn to route cross-modal information to shared
+        # tokens and modality-specific information to private tokens.
+        if use_token_type_embed:
+            self.token_type_embed = nn.Parameter(
+                torch.randn(1, n_registers, hidden_dim) * 0.02
+            )
+
         # Transformer layers with custom attention masking
         self.layers = nn.ModuleList([
             RegisterTransformerLayer(
@@ -94,24 +110,35 @@ class RegisterTokenModule(nn.Module):
 
         self.norm = nn.LayerNorm(hidden_dim)
 
-        # Pre-compute valid K_keep values for nested dropout
+        # Pre-compute valid K_keep values for nested dropout on SHARED tokens only.
+        # Previously this operated on all n_registers, causing resource contention:
+        # when k_keep < n_shared, private tokens were always zeroed (67% of steps),
+        # starving the preservation loss of gradients.
         if nested_dropout_mode == "power_of_two":
-            # {1, 2, 4, 8, ..., n_registers} intersected with powers of 2
-            self._k_keep_values = []
+            self._k_keep_shared_values = []
             k = 1
-            while k <= n_registers:
-                self._k_keep_values.append(k)
+            while k <= n_shared:
+                self._k_keep_shared_values.append(k)
                 k *= 2
-            if self._k_keep_values[-1] != n_registers:
-                self._k_keep_values.append(n_registers)
+            if self._k_keep_shared_values[-1] != n_shared:
+                self._k_keep_shared_values.append(n_shared)
         else:
-            self._k_keep_values = list(range(1, n_registers + 1))
+            self._k_keep_shared_values = list(range(1, n_shared + 1))
 
         self._init_weights()
+
+        # Scale token type embeddings AFTER _init_weights to seed the
+        # shared vs private distinction (otherwise trunc_normal_ clobbers it).
+        if use_token_type_embed:
+            with torch.no_grad():
+                self.token_type_embed[:, :n_shared, :] *= 0.5
+                self.token_type_embed[:, n_shared:, :] *= -0.5
 
     def _init_weights(self):
         nn.init.trunc_normal_(self.register_tokens, std=0.02)
         nn.init.trunc_normal_(self.register_pos_embed, std=0.02)
+        if self.use_token_type_embed:
+            nn.init.trunc_normal_(self.token_type_embed, std=0.02)
         nn.init.xavier_uniform_(self.input_proj.weight)
         nn.init.zeros_(self.input_proj.bias)
 
@@ -142,10 +169,10 @@ class RegisterTokenModule(nn.Module):
 
         return mask
 
-    def _sample_k_keep(self) -> int:
-        """Sample number of register tokens to keep during nested dropout."""
-        idx = torch.randint(0, len(self._k_keep_values), (1,)).item()
-        return self._k_keep_values[idx]
+    def _sample_k_keep_shared(self) -> int:
+        """Sample number of shared register tokens to keep during nested dropout."""
+        idx = torch.randint(0, len(self._k_keep_shared_values), (1,)).item()
+        return self._k_keep_shared_values[idx]
 
     def forward(
         self,
@@ -161,7 +188,7 @@ class RegisterTokenModule(nn.Module):
         Returns:
             shared_tokens: (B, n_shared, hidden_dim) - for cross-modal contrastive alignment
             private_tokens: (B, n_private, hidden_dim) - modality-specific preservation
-            k_keep: Number of tokens kept (n_registers if no dropout applied)
+            k_keep: Number of shared tokens kept (n_shared if no dropout applied)
         """
         B, N, _ = encoder_features.shape
         device = encoder_features.device
@@ -171,6 +198,8 @@ class RegisterTokenModule(nn.Module):
 
         # Expand register tokens for the batch
         registers = self.register_tokens.expand(B, -1, -1) + self.register_pos_embed
+        if self.use_token_type_embed:
+            registers = registers + self.token_type_embed
 
         # Concatenate: [input_tokens, register_tokens]
         x = torch.cat([x_input, registers], dim=1)  # (B, N + n_reg, hidden_dim)
@@ -187,20 +216,23 @@ class RegisterTokenModule(nn.Module):
         # Extract only register tokens (discard input tokens)
         register_out = x[:, N:, :]  # (B, n_registers, hidden_dim)
 
-        # Apply nested dropout
-        use_dropout = apply_nested_dropout if apply_nested_dropout is not None else (self.nested_dropout and self.training)
-        if use_dropout:
-            k_keep = self._sample_k_keep()
-            # Zero out tokens beyond k_keep
-            if k_keep < self.n_registers:
-                register_out = register_out.clone()
-                register_out[:, k_keep:, :] = 0.0
-        else:
-            k_keep = self.n_registers
-
-        # Split into shared and private
+        # Split into shared and private BEFORE nested dropout
+        # This prevents resource contention: nested dropout should only affect
+        # shared tokens (coarse-to-fine hierarchy for contrastive alignment),
+        # not private tokens (which need stable gradients for preservation loss).
         shared_tokens = register_out[:, :self.n_shared, :]
         private_tokens = register_out[:, self.n_shared:, :]
+
+        # Apply nested dropout only to shared tokens
+        use_dropout = apply_nested_dropout if apply_nested_dropout is not None else (self.nested_dropout and self.training)
+        if use_dropout:
+            k_keep = self._sample_k_keep_shared()
+            # Zero out shared tokens beyond k_keep
+            if k_keep < self.n_shared:
+                shared_tokens = shared_tokens.clone()
+                shared_tokens[:, k_keep:, :] = 0.0
+        else:
+            k_keep = self.n_shared
 
         return shared_tokens, private_tokens, k_keep
 

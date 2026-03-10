@@ -1,0 +1,22 @@
+# Sweep: 16 register tokens (4 shared + 12 private)
+model:
+  hidden_dim: 512
+  n_registers: 16
+  n_shared: 4
+  n_layers: 4
+  n_heads: 8
+  model_dropout: 0.1
+  nested_dropout: true
+  nested_dropout_mode: "power_of_two"
+
+loss:
+  loss_type: "contrastive"
+  contrastive_weight: 1.0
+  preservation_weight: 0.5
+
+training:
+  epochs: 100
+  batch_size: 256
+  base_lr: 3.0e-4
+  warmup_epochs: 10
+  seed: 42

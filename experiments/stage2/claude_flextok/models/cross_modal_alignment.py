@@ -17,6 +17,7 @@ Architecture:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Optional, Tuple, List
 from types import SimpleNamespace
@@ -62,6 +63,7 @@ class CrossModalAlignmentModel(nn.Module):
         nested_dropout: bool = True,
         nested_dropout_mode: str = "power_of_two",
         init_logit_scale: float = np.log(1 / 0.07),
+        use_token_type_embed: bool = True,
     ):
         super().__init__()
 
@@ -90,6 +92,7 @@ class CrossModalAlignmentModel(nn.Module):
                 dropout=dropout,
                 nested_dropout=nested_dropout,
                 nested_dropout_mode=nested_dropout_mode,
+                use_token_type_embed=use_token_type_embed,
             )
 
         self.feature_types = {k: v["feature_type"] for k, v in modality_configs.items()}
@@ -152,8 +155,12 @@ class CrossModalAlignmentModel(nn.Module):
 
             shared_tokens, private_tokens, k_keep = self.register_modules[mod_name](features)
 
-            # Pool shared tokens -> single vector, then project and normalize
-            shared_pooled = shared_tokens.mean(dim=1)  # (B, hidden_dim)
+            # Pool only non-zeroed shared tokens to avoid dilution from nested dropout.
+            # k_keep indicates how many shared tokens are active (rest are zeroed).
+            if k_keep < shared_tokens.shape[1]:
+                shared_pooled = shared_tokens[:, :k_keep, :].mean(dim=1)
+            else:
+                shared_pooled = shared_tokens.mean(dim=1)  # (B, hidden_dim)
             shared_proj = self.shared_projectors[mod_name](shared_pooled)
             shared_proj = F.normalize(shared_proj, dim=-1)
 
@@ -167,9 +174,6 @@ class CrossModalAlignmentModel(nn.Module):
         output["logit_scale"] = self.logit_scale.exp()
         return output
 
-
-# Need F for normalize
-import torch.nn.functional as F
 
 
 class Stage2Wrapper(nn.Module):

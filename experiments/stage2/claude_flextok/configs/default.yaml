@@ -8,7 +8,7 @@ model:
   n_shared: 8              # Registers for cross-modal alignment
   n_layers: 4              # Transformer depth per modality
   n_heads: 8
-  dropout: 0.1
+  model_dropout: 0.1
   nested_dropout: true
   nested_dropout_mode: "power_of_two"
 
@@ -23,7 +23,7 @@ modalities:
 
 # ---- Loss ----
 loss:
-  type: "contrastive"       # "contrastive", "flow_matching", or "combined"
+  loss_type: "contrastive"  # "contrastive", "flow_matching", or "combined"
   contrastive_weight: 1.0
   preservation_weight: 0.5
   flow_matching_weight: 0.5

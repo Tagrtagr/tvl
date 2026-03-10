@@ -6,6 +6,7 @@ from the register token bottleneck. Supports:
   - MSE (L2) loss in pixel space
   - L1 loss in pixel space
   - Optional perceptual loss via frozen encoder features (lightweight)
+  - OAT-style prefix reconstruction loss (train with random prefix lengths)
 """
 
 import torch
@@ -97,14 +98,136 @@ class ReconstructionLoss(nn.Module):
             if self.perceptual_weight > 0:
                 losses["recon_perceptual_avg"] = total_perceptual / n_modalities
 
+        # Infer device from input tensors for fallback zeros
+        _device = next(iter(targets.values())).device if targets else torch.device("cpu")
         # Total reconstruction loss
-        total = losses.get("recon_pixel_avg", torch.tensor(0.0))
+        total = losses.get("recon_pixel_avg", torch.tensor(0.0, device=_device))
         if self.perceptual_weight > 0:
             total = total + self.perceptual_weight * losses.get(
-                "recon_perceptual_avg", torch.tensor(0.0)
+                "recon_perceptual_avg", torch.tensor(0.0, device=_device)
             )
         losses["recon_total"] = total
 
         if output_dict:
             return losses
         return total
+
+
+class PrefixReconstructionLoss(nn.Module):
+    """
+    OAT-style prefix reconstruction loss.
+
+    Instead of only reconstructing from all tokens, randomly sample a prefix
+    length K and reconstruct using only the first K tokens. This enforces
+    the coarse-to-fine ordering: earlier tokens must capture enough global
+    information to produce a reasonable reconstruction on their own.
+
+    The loss is a weighted average of full reconstruction and prefix
+    reconstruction, encouraging the model to distribute information
+    hierarchically across the token sequence.
+
+    Args:
+        loss_type: "mse", "l1", or "smooth_l1".
+        prefix_weight: Weight for prefix reconstruction loss relative to full.
+        prefix_schedule: List of valid prefix lengths to sample from.
+            If None, uses power-of-two schedule up to n_registers.
+    """
+
+    def __init__(
+        self,
+        loss_type: str = "mse",
+        prefix_weight: float = 0.5,
+        prefix_schedule: Optional[List[int]] = None,
+    ):
+        super().__init__()
+        self.prefix_weight = prefix_weight
+        self.prefix_schedule = prefix_schedule
+
+        if loss_type == "mse":
+            self.pixel_loss_fn = nn.MSELoss()
+        elif loss_type == "l1":
+            self.pixel_loss_fn = nn.L1Loss()
+        elif loss_type == "smooth_l1":
+            self.pixel_loss_fn = nn.SmoothL1Loss()
+        else:
+            raise ValueError(f"Unknown loss_type: {loss_type}")
+
+    def _get_prefix_schedule(self, n_registers: int) -> List[int]:
+        """Get power-of-two prefix lengths up to n_registers."""
+        if self.prefix_schedule is not None:
+            return self.prefix_schedule
+        lengths = []
+        k = 1
+        while k <= n_registers:
+            lengths.append(k)
+            k *= 2
+        if lengths[-1] != n_registers:
+            lengths.append(n_registers)
+        return lengths
+
+    def forward(
+        self,
+        all_tokens: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        decoders: Dict[str, nn.Module],
+        output_dict: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            all_tokens: Maps modality -> (B, n_registers, hidden_dim) all register tokens.
+            targets: Maps modality -> (B, 3, 224, 224) original images.
+            decoders: Maps modality -> ReconstructionDecoder.
+
+        Returns:
+            Dict with full recon loss, prefix recon loss, and combined total.
+        """
+        losses = {}
+        total_full = 0.0
+        total_prefix = 0.0
+        n_modalities = 0
+        n_prefix_modalities = 0
+
+        for mod_name in all_tokens:
+            if mod_name not in targets or mod_name not in decoders:
+                continue
+
+            tokens = all_tokens[mod_name]
+            target = targets[mod_name]
+            decoder = decoders[mod_name]
+            n_reg = tokens.shape[1]
+
+            # Full reconstruction
+            full_recon = decoder(tokens)
+            full_loss = self.pixel_loss_fn(full_recon, target)
+            losses[f"recon_full_{mod_name}"] = full_loss
+            total_full += full_loss
+            n_modalities += 1
+
+            # Prefix reconstruction (sample a random prefix length)
+            schedule = self._get_prefix_schedule(n_reg)
+            # Exclude the full length — we already computed that
+            prefix_candidates = [k for k in schedule if k < n_reg]
+            if prefix_candidates:
+                idx = torch.randint(0, len(prefix_candidates), (1,)).item()
+                k = prefix_candidates[idx]
+                prefix_recon = decoder.forward_prefix(tokens, k=k)
+                prefix_loss = self.pixel_loss_fn(prefix_recon, target)
+                losses[f"recon_prefix_k{k}_{mod_name}"] = prefix_loss
+                total_prefix += prefix_loss
+                n_prefix_modalities += 1
+
+        if n_modalities > 0:
+            losses["recon_full_avg"] = total_full / n_modalities
+        if n_prefix_modalities > 0:
+            losses["recon_prefix_avg"] = total_prefix / n_prefix_modalities
+
+        # Infer device from input tensors for fallback zeros
+        _device = next(iter(targets.values())).device if targets else torch.device("cpu")
+        # Combined: full + prefix_weight * prefix
+        full_avg = losses.get("recon_full_avg", torch.tensor(0.0, device=_device))
+        prefix_avg = losses.get("recon_prefix_avg", torch.tensor(0.0, device=_device))
+        losses["recon_total"] = full_avg + self.prefix_weight * prefix_avg
+
+        if output_dict:
+            return losses
+        return losses["recon_total"]
