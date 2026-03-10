@@ -2,8 +2,11 @@
 #
 # Incorporates insights from Ordered Action Tokenization (OAT):
 #   - Token type embeddings to distinguish shared vs private tokens
-#   - Prefix reconstruction loss to enforce coarse-to-fine ordering
+#   - Contrastive alignment with information preservation
 #   - Nested dropout with power-of-two schedule
+#
+# Note: Prefix reconstruction loss is available separately via --use_prefix_recon.
+# This config uses contrastive alignment + preservation only.
 #
 # Reference: https://ordered-action-tokenization.github.io/
 
@@ -13,12 +16,12 @@ model:
   n_shared: 8
   n_layers: 4
   n_heads: 8
-  dropout: 0.1
+  model_dropout: 0.1
   nested_dropout: true
   nested_dropout_mode: "power_of_two"
 
 loss:
-  type: "contrastive"
+  loss_type: "contrastive"
   contrastive_weight: 1.0
   preservation_weight: 0.5
 

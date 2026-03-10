@@ -130,7 +130,9 @@ def plot_prefix_reconstruction(model, recon_decoders, dataloader, n_registers,
     for k, v in batch.items():
         if isinstance(v, list):
             v = v[0]
-        batch[k] = v.to(device, non_blocking=True).squeeze()
+        batch[k] = v.to(device, non_blocking=True)
+        if batch[k].dim() > 4:
+            batch[k] = batch[k].squeeze(1)
 
     prefix_lengths = get_prefix_lengths(n_registers)
 
@@ -201,7 +203,9 @@ def plot_prefix_mse_curve(model, recon_decoders, dataloader, n_registers,
         for k, v in batch.items():
             if isinstance(v, list):
                 v = v[0]
-            batch[k] = v.to(device, non_blocking=True).squeeze()
+            batch[k] = v.to(device, non_blocking=True)
+            if batch[k].dim() > 4:
+                batch[k] = batch[k].squeeze(1)
 
         with torch.no_grad(), torch.cuda.amp.autocast():
             frozen_features = model.frozen_encoder(batch)

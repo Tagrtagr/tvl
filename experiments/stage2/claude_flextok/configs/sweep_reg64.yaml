@@ -5,12 +5,12 @@ model:
   n_shared: 16
   n_layers: 4
   n_heads: 8
-  dropout: 0.1
+  model_dropout: 0.1
   nested_dropout: true
   nested_dropout_mode: "power_of_two"
 
 loss:
-  type: "contrastive"
+  loss_type: "contrastive"
   contrastive_weight: 1.0
   preservation_weight: 0.5
 

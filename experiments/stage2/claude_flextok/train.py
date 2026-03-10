@@ -424,7 +424,7 @@ def train_one_epoch(
                     if all_tokens:
                         prefix_dict = prefix_recon_loss_fn(all_tokens, targets_pf, recon_decoders)
                         prefix_loss = prefix_dict["recon_total"]
-                        loss = loss + args.reconstruction_weight * prefix_loss
+                        loss = loss + args.prefix_recon_weight * prefix_loss
                         for k, v in prefix_dict.items():
                             if isinstance(v, torch.Tensor):
                                 loss_dict[f"prefix_{k}"] = v
