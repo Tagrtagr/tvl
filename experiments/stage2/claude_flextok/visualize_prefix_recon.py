@@ -67,27 +67,47 @@ def unnormalize(tensor, mean, std):
 
 def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
                              n_shared=8, hidden_dim=512, device="cuda"):
-    """Load Stage 2 model + reconstruction decoders from a checkpoint."""
+    """Load Stage 2 model + reconstruction decoders from a checkpoint.
+
+    Model parameters are read from the saved run configuration in
+    ckpt["args"] when available, falling back to the function defaults.
+    """
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    saved_args = ckpt.get("args", {})
+
+    # Read model hyperparameters from checkpoint args, fall back to defaults
+    n_registers = saved_args.get("n_registers", n_registers)
+    n_shared = saved_args.get("n_shared", n_shared)
+    hidden_dim = saved_args.get("hidden_dim", hidden_dim)
+    n_layers = saved_args.get("n_layers", 4)
+    n_heads = saved_args.get("n_heads", 8)
+    tactile_model = saved_args.get("tactile_model", "vit_tiny_patch16_224")
+    base_channels = saved_args.get("recon_base_channels", 64)
+    n_decoder_layers = saved_args.get("recon_decoder_layers", 2)
+
     frozen_encoder = TVL(
-        tactile_model="vit_tiny_patch16_224",
+        tactile_model=tactile_model,
         active_modalities=[ModalityType.VISION, ModalityType.TACTILE],
     )
     if stage1_checkpoint and os.path.exists(stage1_checkpoint):
-        ckpt = torch.load(stage1_checkpoint, map_location="cpu")
-        state = ckpt.get("model", ckpt)
+        s1_ckpt = torch.load(stage1_checkpoint, map_location="cpu")
+        state = s1_ckpt.get("model", s1_ckpt)
         frozen_encoder.load_state_dict(state, strict=False)
+
+    # Determine input dims from frozen encoder
+    vision_dim = frozen_encoder.clip.visual.output_dim if hasattr(frozen_encoder.clip.visual, "output_dim") else 768
+    tactile_dim = frozen_encoder.tactile_encoder.num_classes if frozen_encoder.tactile_encoder.num_classes > 0 else frozen_encoder.tactile_encoder.num_features
 
     alignment_model = CrossModalAlignmentModel(
         modality_configs={
-            ModalityType.VISION: {"input_dim": 768, "feature_type": "pooled"},
-            ModalityType.TACTILE: {"input_dim": 768, "feature_type": "pooled"},
+            ModalityType.VISION: {"input_dim": vision_dim, "feature_type": "pooled"},
+            ModalityType.TACTILE: {"input_dim": tactile_dim, "feature_type": "pooled"},
         },
         hidden_dim=hidden_dim, n_registers=n_registers, n_shared=n_shared,
-        n_layers=4, n_heads=8,
+        n_layers=n_layers, n_heads=n_heads,
     )
     model = Stage2Wrapper(frozen_encoder, alignment_model)
 
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
     model.alignment_model.load_state_dict(ckpt.get("alignment_model", {}), strict=False)
     model.to(device).eval()
 
@@ -106,12 +126,14 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
         if is_autoregressive:
             dec = AutoregressiveDecoder(
                 n_registers=n_registers, hidden_dim=hidden_dim,
-                base_channels=64, n_decoder_layers=2, n_heads=8,
+                base_channels=base_channels, n_decoder_layers=n_decoder_layers,
+                n_heads=n_heads,
             )
         else:
             dec = ReconstructionDecoder(
                 n_registers=n_registers, hidden_dim=hidden_dim,
-                base_channels=64, n_decoder_layers=2, n_heads=8,
+                base_channels=base_channels, n_decoder_layers=n_decoder_layers,
+                n_heads=n_heads,
             )
         dec.load_state_dict(state)
         dec.to(device).eval()
@@ -307,7 +329,7 @@ def main():
         text_prompt="This image gives tactile feelings of ",
     )
     loader = DataLoader(dataset_val, batch_size=max(args.n_samples, 16),
-                        shuffle=True, num_workers=2)
+                        shuffle=False, num_workers=2)
 
     if args.checkpoint:
         # Single checkpoint mode

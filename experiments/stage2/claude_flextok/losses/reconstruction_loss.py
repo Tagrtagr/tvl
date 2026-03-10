@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, List
-import random
 
 
 class ReconstructionLoss(nn.Module):
@@ -209,7 +208,8 @@ class PrefixReconstructionLoss(nn.Module):
             # Exclude the full length — we already computed that
             prefix_candidates = [k for k in schedule if k < n_reg]
             if prefix_candidates:
-                k = random.choice(prefix_candidates)
+                idx = torch.randint(0, len(prefix_candidates), (1,)).item()
+                k = prefix_candidates[idx]
                 prefix_recon = decoder.forward_prefix(tokens, k=k)
                 prefix_loss = self.pixel_loss_fn(prefix_recon, target)
                 losses[f"recon_prefix_k{k}_{mod_name}"] = prefix_loss

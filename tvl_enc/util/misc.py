@@ -251,7 +251,7 @@ def init_distributed_mode(args):
                     ['scontrol', 'show', 'hostnames', node_list],
                     capture_output=True, text=True, check=True,
                 )
-                hostnames = [h for h in result.stdout.splitlines() if h.strip()]
+                hostnames = [h.strip() for h in result.stdout.splitlines() if h.strip()]
                 if not hostnames:
                     raise RuntimeError(f'scontrol returned empty for SLURM_NODELIST={node_list}')
                 os.environ['MASTER_ADDR'] = hostnames[0]
@@ -265,6 +265,7 @@ def init_distributed_mode(args):
                     ) from exc
         if 'MASTER_PORT' not in os.environ:
             os.environ['MASTER_PORT'] = '29500'
+        args.dist_url = "tcp://%s:%s" % (os.environ['MASTER_ADDR'], os.environ['MASTER_PORT'])
     else:
         print('Not using distributed mode')
         setup_for_distributed(is_master=True)  # hack

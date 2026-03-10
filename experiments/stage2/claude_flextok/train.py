@@ -424,9 +424,11 @@ def train_one_epoch(
                             all_tokens[mod_name] = alignment_output[all_tokens_key]
                             targets_pf[mod_name] = samples[mod_name]
                     if all_tokens:
-                        prefix_dict = prefix_recon_loss_fn(all_tokens, targets_pf, recon_decoders)
+                        # Unwrap DDP so PrefixReconstructionLoss can call decoder.forward_prefix
+                        raw_decoders = {m: _unwrap(d) for m, d in recon_decoders.items()}
+                        prefix_dict = prefix_recon_loss_fn(all_tokens, targets_pf, raw_decoders)
                         prefix_loss = prefix_dict["recon_total"]
-                        loss = loss + args.prefix_recon_weight * prefix_loss
+                        loss = loss + prefix_loss
                         for k, v in prefix_dict.items():
                             if isinstance(v, torch.Tensor):
                                 loss_dict[f"prefix_{k}"] = v
@@ -477,7 +479,7 @@ def train_one_epoch(
 @torch.no_grad()
 def evaluate(
     data_loader, contrastive_loss_fn, model, device, epoch=None, log_writer=None,
-    recon_decoders=None, recon_loss_fn=None, args=None,
+    recon_decoders=None, recon_loss_fn=None, prefix_recon_loss_fn=None, args=None,
 ):
     metric_logger = misc.MetricLogger(delimiter="  ")
     header = "Test:"
@@ -506,7 +508,8 @@ def evaluate(
             )
 
             # Reconstruction loss (if enabled)
-            if recon_decoders is not None and recon_loss_fn is not None:
+            # Skip standalone recon when prefix recon is active (mirrors training)
+            if recon_decoders is not None and recon_loss_fn is not None and prefix_recon_loss_fn is None:
                 recons = {}
                 targets = {}
                 for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
@@ -519,6 +522,25 @@ def evaluate(
                     for k_r, v_r in recon_dict.items():
                         if isinstance(v_r, torch.Tensor):
                             loss_dict[k_r] = v_r
+
+            # OAT-style prefix reconstruction loss (if enabled)
+            if prefix_recon_loss_fn is not None and recon_decoders is not None:
+                all_tokens = {}
+                targets_pf = {}
+                for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+                    all_tokens_key = f"{mod_name}_all_tokens"
+                    if all_tokens_key in alignment_output and mod_name in batch:
+                        all_tokens[mod_name] = alignment_output[all_tokens_key]
+                        targets_pf[mod_name] = batch[mod_name]
+                if all_tokens:
+                    # Unwrap DDP so PrefixReconstructionLoss can call decoder.forward_prefix
+                    raw_decoders = {m: _unwrap(d) for m, d in recon_decoders.items()}
+                    prefix_dict = prefix_recon_loss_fn(all_tokens, targets_pf, raw_decoders)
+                    for k_r, v_r in prefix_dict.items():
+                        if isinstance(v_r, torch.Tensor):
+                            loss_dict[f"prefix_{k_r}"] = v_r
+                    # Use prefix recon_total for model selection
+                    loss_dict["recon_total"] = prefix_dict["recon_total"]
 
         loss = loss_dict["total_loss"]
         recon_total = loss_dict.get("recon_total")
@@ -755,7 +777,7 @@ def main(args):
         val_stats = evaluate(data_loader_val, contrastive_loss_fn, model, device,
                              epoch=epoch, log_writer=log_writer,
                              recon_decoders=recon_decoders, recon_loss_fn=recon_loss_fn,
-                             args=args)
+                             prefix_recon_loss_fn=prefix_recon_loss_fn, args=args)
 
         acc1 = val_stats.get("acc1", 0.0)
         recon_loss_val = val_stats.get("recon_total", val_stats.get("recon_pixel_avg", float("inf")))
