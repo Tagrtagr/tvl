@@ -599,12 +599,17 @@ def main(args):
     stage = getattr(args, "stage", "joint")
     if stage == "reconstruction":
         # Load and freeze alignment model for decoder-only training
-        if args.alignment_checkpoint and os.path.exists(args.alignment_checkpoint):
-            print(f"Loading alignment checkpoint: {args.alignment_checkpoint}")
-            align_ckpt = torch.load(args.alignment_checkpoint, map_location="cpu")
-            model_without_ddp.alignment_model.load_state_dict(
-                align_ckpt.get("alignment_model", {}), strict=False,
+        if not args.alignment_checkpoint or not os.path.exists(args.alignment_checkpoint):
+            raise FileNotFoundError(
+                "--stage reconstruction requires a valid --alignment_checkpoint"
             )
+        print(f"Loading alignment checkpoint: {args.alignment_checkpoint}")
+        align_ckpt = torch.load(args.alignment_checkpoint, map_location="cpu")
+        if "alignment_model" not in align_ckpt:
+            raise KeyError("alignment checkpoint is missing 'alignment_model' key")
+        model_without_ddp.alignment_model.load_state_dict(
+            align_ckpt["alignment_model"], strict=False,
+        )
         for p in model_without_ddp.alignment_model.parameters():
             p.requires_grad = False
         n_frozen = sum(p.numel() for p in model_without_ddp.alignment_model.parameters())
@@ -674,6 +679,12 @@ def main(args):
             model, device_ids=[args.gpu], find_unused_parameters=True,
         )
         model_without_ddp = model.module
+        # Wrap reconstruction decoders in DDP to synchronize gradients across ranks
+        if recon_decoders is not None:
+            for mod_name in list(recon_decoders.keys()):
+                recon_decoders[mod_name] = torch.nn.parallel.DistributedDataParallel(
+                    recon_decoders[mod_name], device_ids=[args.gpu],
+                )
 
     # Build loss
     contrastive_loss_fn, flow_loss_fn = build_loss(args, device)

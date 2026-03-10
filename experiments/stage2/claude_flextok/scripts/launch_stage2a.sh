@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/stage2a_%j.out
-#SBATCH --error=logs/stage2a_%j.err
+#SBATCH --output=stage2a_%j.out
+#SBATCH --error=stage2a_%j.err
 
 # =============================================================================
 # Stage 2a: Alignment Training (Register Tokens)

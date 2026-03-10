@@ -50,6 +50,7 @@ from tvl_enc.tacvis import TacVisDataset, RGB_AUGMENTS, TAC_AUGMENTS
 from tvl_enc.tvl import TVL, ModalityType
 from models.cross_modal_alignment import CrossModalAlignmentModel, Stage2Wrapper
 from models.reconstruction_decoder import ReconstructionDecoder
+from models.autoregressive_decoder import AutoregressiveDecoder
 
 # Normalization constants
 RGB_MEAN = np.array([0.48145466, 0.4578275, 0.40821073])
@@ -92,13 +93,27 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
 
     recon_decoders = {}
     for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-        dec = ReconstructionDecoder(
-            n_registers=n_registers, hidden_dim=hidden_dim,
-            base_channels=64, n_decoder_layers=2, n_heads=8,
-        )
         key = f"recon_decoder_{mod_name}"
-        if key in ckpt:
-            dec.load_state_dict(ckpt[key])
+        if key not in ckpt:
+            raise KeyError(
+                f"Checkpoint missing '{key}'. This visualization requires a "
+                "reconstruction checkpoint (from Stage 2b or joint training)."
+            )
+        # Detect decoder type from saved state: autoregressive decoders have
+        # cross-attention keys while convolutional decoders don't.
+        state = ckpt[key]
+        is_autoregressive = any("cross_attn" in k or "spatial_queries" in k for k in state)
+        if is_autoregressive:
+            dec = AutoregressiveDecoder(
+                n_registers=n_registers, hidden_dim=hidden_dim,
+                base_channels=64, n_decoder_layers=2, n_heads=8,
+            )
+        else:
+            dec = ReconstructionDecoder(
+                n_registers=n_registers, hidden_dim=hidden_dim,
+                base_channels=64, n_decoder_layers=2, n_heads=8,
+            )
+        dec.load_state_dict(state)
         dec.to(device).eval()
         recon_decoders[mod_name] = dec
 

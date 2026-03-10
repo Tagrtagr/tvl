@@ -245,18 +245,24 @@ def init_distributed_mode(args):
         if 'MASTER_ADDR' not in os.environ:
             import subprocess
             node_list = os.environ.get('SLURM_NODELIST', 'localhost')
+            num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', '1'))
             try:
-                result = subprocess.run(['scontrol', 'show', 'hostnames', node_list],
-                                        capture_output=True, text=True)
-                addr = result.stdout.strip().split('\n')[0] if result.returncode == 0 else ''
-                if not addr:
-                    print(f'WARNING: scontrol failed or returned empty for SLURM_NODELIST={node_list}, '
-                          'falling back to localhost')
-                    addr = 'localhost'
-                os.environ['MASTER_ADDR'] = addr
-            except FileNotFoundError:
-                print('WARNING: scontrol not found, falling back to localhost')
-                os.environ['MASTER_ADDR'] = 'localhost'
+                result = subprocess.run(
+                    ['scontrol', 'show', 'hostnames', node_list],
+                    capture_output=True, text=True, check=True,
+                )
+                hostnames = [h for h in result.stdout.splitlines() if h.strip()]
+                if not hostnames:
+                    raise RuntimeError(f'scontrol returned empty for SLURM_NODELIST={node_list}')
+                os.environ['MASTER_ADDR'] = hostnames[0]
+            except (FileNotFoundError, subprocess.CalledProcessError, RuntimeError) as exc:
+                if num_nodes == 1:
+                    print(f'WARNING: {exc}; single-node job, falling back to 127.0.0.1')
+                    os.environ['MASTER_ADDR'] = '127.0.0.1'
+                else:
+                    raise RuntimeError(
+                        f'Failed to derive MASTER_ADDR from SLURM_NODELIST={node_list}'
+                    ) from exc
         if 'MASTER_PORT' not in os.environ:
             os.environ['MASTER_PORT'] = '29500'
     else:

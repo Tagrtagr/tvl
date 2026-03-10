@@ -5,8 +5,8 @@
 #SBATCH --cpus-per-task=40
 #SBATCH --mem=128G
 #SBATCH --time=12:00:00
-#SBATCH --output=logs/stage2a_4gpu_%j.out
-#SBATCH --error=logs/stage2a_4gpu_%j.err
+#SBATCH --output=stage2a_4gpu_%j.out
+#SBATCH --error=stage2a_4gpu_%j.err
 
 # =============================================================================
 # Stage 2a: Multi-GPU Alignment Training (4x GPU with DDP)

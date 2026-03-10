@@ -5,8 +5,8 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/stage2b_%j.out
-#SBATCH --error=logs/stage2b_%j.err
+#SBATCH --output=stage2b_%j.out
+#SBATCH --error=stage2b_%j.err
 
 # =============================================================================
 # Stage 2b: Reconstruction Decoder Training
