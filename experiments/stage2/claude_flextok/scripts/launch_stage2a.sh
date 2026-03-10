@@ -25,8 +25,8 @@
 set -e
 
 # ---- Paths (edit these for your setup) ----
-STAGE1_CKPT="/viscam/u/taarush/tvl_enc_vittiny.pth"
-DATASETS_DIR="/viscam/u/taarush/ssvtp"
+STAGE1_CKPT="${STAGE1_CKPT:-/viscam/u/taarush/tvl_enc_vittiny.pth}"
+DATASETS_DIR="${DATASETS_DIR:-/viscam/u/taarush/ssvtp}"
 OUTPUT_DIR="experiments/stage2/runs/stage2a_alignment"
 LOG_NAME="stage2a_alignment"
 
@@ -43,7 +43,7 @@ if [ ! -d "$DATASETS_DIR/ssvtp" ]; then
 fi
 
 # ---- Setup ----
-# SBATCH --chdir sets working directory to repo root
+cd "$(dirname "$0")/../../../.."
 mkdir -p "$OUTPUT_DIR" logs
 
 echo "========================================="

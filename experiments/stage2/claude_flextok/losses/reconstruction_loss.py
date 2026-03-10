@@ -184,6 +184,7 @@ class PrefixReconstructionLoss(nn.Module):
         total_full = 0.0
         total_prefix = 0.0
         n_modalities = 0
+        n_prefix_modalities = 0
 
         for mod_name in all_tokens:
             if mod_name not in targets or mod_name not in decoders:
@@ -199,6 +200,7 @@ class PrefixReconstructionLoss(nn.Module):
             full_loss = self.pixel_loss_fn(full_recon, target)
             losses[f"recon_full_{mod_name}"] = full_loss
             total_full += full_loss
+            n_modalities += 1
 
             # Prefix reconstruction (sample a random prefix length)
             schedule = self._get_prefix_schedule(n_reg)
@@ -210,12 +212,12 @@ class PrefixReconstructionLoss(nn.Module):
                 prefix_loss = self.pixel_loss_fn(prefix_recon, target)
                 losses[f"recon_prefix_k{k}_{mod_name}"] = prefix_loss
                 total_prefix += prefix_loss
-
-            n_modalities += 1
+                n_prefix_modalities += 1
 
         if n_modalities > 0:
             losses["recon_full_avg"] = total_full / n_modalities
-            losses["recon_prefix_avg"] = total_prefix / n_modalities
+        if n_prefix_modalities > 0:
+            losses["recon_prefix_avg"] = total_prefix / n_prefix_modalities
 
         # Combined: full + prefix_weight * prefix
         full_avg = losses.get("recon_full_avg", torch.tensor(0.0))

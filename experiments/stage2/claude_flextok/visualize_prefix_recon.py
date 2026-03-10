@@ -150,34 +150,40 @@ def plot_prefix_reconstruction(model, recon_decoders, dataloader, n_registers,
         decoder = recon_decoders[mod_name]
         originals = batch[mod_name]
 
+        # Clamp n_samples to actual batch size
+        n_rows = min(n_samples, originals.shape[0])
+
+        # Precompute all prefix reconstructions once (avoid redundant batch decoding)
+        prefix_recons = {}
+        for k in prefix_lengths:
+            with torch.no_grad(), torch.cuda.amp.autocast():
+                prefix_recons[k] = decoder.forward_prefix(all_tokens, k=k)
+
         n_cols = 1 + len(prefix_lengths)  # original + each prefix
-        fig, axes = plt.subplots(n_samples, n_cols, figsize=(2.5 * n_cols, 2.5 * n_samples))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.5 * n_cols, 2.5 * n_rows))
+        if n_rows == 1:
+            axes = axes[np.newaxis, :]  # ensure 2D indexing
         fig.suptitle(
             f"OAT-Style Prefix Reconstruction — {label} (n_registers={n_registers})\n"
             "Earlier tokens → global structure, Later tokens → fine details",
             fontsize=13, fontweight="bold",
         )
 
-        for row in range(n_samples):
+        for row in range(n_rows):
             # Original
             orig = unnormalize(originals[row].float(), norm_mean, norm_std)
-            ax = axes[row, 0] if n_samples > 1 else axes[0]
-            ax.imshow(orig.cpu().permute(1, 2, 0).numpy())
-            ax.axis("off")
+            axes[row, 0].imshow(orig.cpu().permute(1, 2, 0).numpy())
+            axes[row, 0].axis("off")
             if row == 0:
-                ax.set_title("Original", fontsize=10, fontweight="bold")
+                axes[row, 0].set_title("Original", fontsize=10, fontweight="bold")
 
             # Prefix reconstructions
             for col_idx, k in enumerate(prefix_lengths):
-                with torch.no_grad(), torch.cuda.amp.autocast():
-                    recon = decoder.forward_prefix(all_tokens, k=k)
-                recon_img = unnormalize(recon[row].float(), norm_mean, norm_std)
-
-                ax = axes[row, col_idx + 1] if n_samples > 1 else axes[col_idx + 1]
-                ax.imshow(recon_img.cpu().permute(1, 2, 0).numpy())
-                ax.axis("off")
+                recon_img = unnormalize(prefix_recons[k][row].float(), norm_mean, norm_std)
+                axes[row, col_idx + 1].imshow(recon_img.cpu().permute(1, 2, 0).numpy())
+                axes[row, col_idx + 1].axis("off")
                 if row == 0:
-                    ax.set_title(f"k={k}", fontsize=10, fontweight="bold")
+                    axes[row, col_idx + 1].set_title(f"k={k}", fontsize=10, fontweight="bold")
 
         plt.tight_layout()
         path = os.path.join(output_dir, f"prefix_recon_{label.lower()}_reg{n_registers}.png")
@@ -304,7 +310,6 @@ def main():
     elif args.sweep_dir:
         # Sweep mode: compare across register counts
         sweep_configs = {8: 2, 16: 4, 32: 8, 64: 16}
-        all_mse_curves = {}
 
         for n_reg, n_shared in sweep_configs.items():
             ckpt_path = os.path.join(args.sweep_dir, f"reg{n_reg}", "checkpoint_best.pth")

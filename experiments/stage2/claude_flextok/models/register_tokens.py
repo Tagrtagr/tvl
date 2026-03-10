@@ -97,11 +97,6 @@ class RegisterTokenModule(nn.Module):
             self.token_type_embed = nn.Parameter(
                 torch.randn(1, n_registers, hidden_dim) * 0.02
             )
-            # Initialize: shared tokens get type 0, private tokens get type 1
-            # (they'll diverge during training but this seeds the distinction)
-            with torch.no_grad():
-                self.token_type_embed[:, :n_shared, :] *= 0.5
-                self.token_type_embed[:, n_shared:, :] *= -0.5
 
         # Transformer layers with custom attention masking
         self.layers = nn.ModuleList([
@@ -131,6 +126,13 @@ class RegisterTokenModule(nn.Module):
             self._k_keep_shared_values = list(range(1, n_shared + 1))
 
         self._init_weights()
+
+        # Scale token type embeddings AFTER _init_weights to seed the
+        # shared vs private distinction (otherwise trunc_normal_ clobbers it).
+        if use_token_type_embed:
+            with torch.no_grad():
+                self.token_type_embed[:, :n_shared, :] *= 0.5
+                self.token_type_embed[:, n_shared:, :] *= -0.5
 
     def _init_weights(self):
         nn.init.trunc_normal_(self.register_tokens, std=0.02)

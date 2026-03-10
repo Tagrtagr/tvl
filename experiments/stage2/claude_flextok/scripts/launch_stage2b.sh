@@ -20,22 +20,22 @@
 set -e
 
 # ---- Paths (edit these for your setup) ----
-STAGE1_CKPT="/viscam/u/taarush/tvl_enc_vittiny.pth"
-ALIGNMENT_CKPT="experiments/stage2/runs/stage2a_alignment/stage2a_alignment/checkpoint_best.pth"
-DATASETS_DIR="/viscam/u/taarush"
+STAGE1_CKPT="${STAGE1_CKPT:-/viscam/u/taarush/tvl_enc_vittiny.pth}"
+ALIGNMENT_CKPT="${ALIGNMENT_CKPT:-experiments/stage2/runs/stage2a_alignment/checkpoint_best.pth}"
+DATASETS_DIR="${DATASETS_DIR:-/viscam/u/taarush}"
 OUTPUT_DIR="experiments/stage2/runs/stage2b_recon"
 LOG_NAME="stage2b_recon"
 
-# ---- Verify paths ----
+# ---- Setup ----
+cd "$(dirname "$0")/../../../.."
+mkdir -p "$OUTPUT_DIR" logs
+
+# ---- Verify paths (after cd so relative paths resolve) ----
 if [ ! -f "$ALIGNMENT_CKPT" ]; then
     echo "ERROR: Alignment checkpoint not found at $ALIGNMENT_CKPT"
     echo "Run Stage 2a first, then update ALIGNMENT_CKPT."
     exit 1
 fi
-
-# ---- Setup ----
-cd "$(dirname "$0")/../../../.."
-mkdir -p "$OUTPUT_DIR" logs
 
 echo "========================================="
 echo "Stage 2b: Reconstruction Decoder Training"

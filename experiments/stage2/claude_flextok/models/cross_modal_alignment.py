@@ -17,6 +17,7 @@ Architecture:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Optional, Tuple, List
 from types import SimpleNamespace
@@ -173,9 +174,6 @@ class CrossModalAlignmentModel(nn.Module):
         output["logit_scale"] = self.logit_scale.exp()
         return output
 
-
-# Need F for normalize
-import torch.nn.functional as F
 
 
 class Stage2Wrapper(nn.Module):

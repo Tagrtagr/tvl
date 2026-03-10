@@ -275,7 +275,7 @@ def test_token_type_embeddings():
 
     x = torch.randn(4, 1, 768)
     module.train()
-    shared, private, k_keep = module(x)
+    shared, private, _k_keep = module(x)
     assert shared.shape == (4, 4, 512)
     assert private.shape == (4, 12, 512)
 
@@ -285,7 +285,7 @@ def test_token_type_embeddings():
         n_shared=4, n_layers=2, n_heads=8,
         use_token_type_embed=False,
     )
-    shared2, private2, _ = module_no_tte(x)
+    shared2, _private2, _ = module_no_tte(x)
     assert shared2.shape == (4, 4, 512)
     print("  PASSED")
 
@@ -396,7 +396,7 @@ def test_autoregressive_decoder_backward():
     assert decoder_has_grad, "No gradients in autoregressive decoder!"
     assert model_has_grad, "No gradients in alignment model!"
     print(f"  recon_loss: {loss.item():.4f}")
-    print(f"  decoder grads: OK, alignment model grads: OK")
+    print("  decoder grads: OK, alignment model grads: OK")
     print("  PASSED")
 
 

@@ -157,7 +157,7 @@ def compare_sweeps(output_root, output_dir=None):
     ax = axes[0]
     bars = ax.bar([str(n) for n in n_regs], best_acc1,
                   color=colors[:len(n_regs)], edgecolor="black", linewidth=0.5)
-    for bar, acc in zip(bars, best_acc1):
+    for bar, acc in zip(bars, best_acc1, strict=True):
         ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.5,
                 f"{acc:.1f}%", ha="center", va="bottom", fontweight="bold")
     ax.set_xlabel("Number of Register Tokens", fontsize=12)
@@ -170,7 +170,7 @@ def compare_sweeps(output_root, output_dir=None):
     ax = axes[1]
     bars = ax.bar([str(n) for n in n_regs], final_recon_loss,
                   color=colors[:len(n_regs)], edgecolor="black", linewidth=0.5)
-    for bar, loss_val in zip(bars, final_recon_loss):
+    for bar, loss_val in zip(bars, final_recon_loss, strict=True):
         ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.001,
                 f"{loss_val:.4f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
     ax.set_xlabel("Number of Register Tokens", fontsize=12)
@@ -233,7 +233,7 @@ def compare_sweeps(output_root, output_dir=None):
     print("\n" + "=" * 70)
     print(f"  {'n_registers':>12} | {'n_shared':>8} | {'Best Acc@1':>10} | {'Final Recon':>12} | {'Epochs':>6}")
     print("-" * 70)
-    for n_reg, acc, recon in zip(n_regs, best_acc1, final_recon_loss):
+    for n_reg, acc, recon in zip(n_regs, best_acc1, final_recon_loss, strict=True):
         cfg = SWEEP_CONFIGS[n_reg]
         n_epochs = len(results[n_reg])
         print(f"  {n_reg:>12} | {cfg['n_shared']:>8} | {acc:>9.1f}% | {recon:>12.4f} | {n_epochs:>6}")

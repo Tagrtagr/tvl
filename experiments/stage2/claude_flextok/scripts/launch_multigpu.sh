@@ -14,8 +14,8 @@
 
 set -e
 
-STAGE1_CKPT="/viscam/u/taarush/tvl_enc_vittiny.pth"
-DATASETS_DIR="/viscam/u/taarush"
+STAGE1_CKPT="${STAGE1_CKPT:-/viscam/u/taarush/tvl_enc_vittiny.pth}"
+DATASETS_DIR="${DATASETS_DIR:-/viscam/u/taarush}"
 OUTPUT_DIR="experiments/stage2/runs/stage2a_4gpu"
 LOG_NAME="stage2a_4gpu"
 NUM_GPUS=4

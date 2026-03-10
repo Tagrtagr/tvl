@@ -396,7 +396,9 @@ def train_one_epoch(
 
             # Reconstruction loss (reconstruction and joint stages)
             if stage != "alignment":
-                if recon_decoders is not None and recon_loss_fn is not None:
+                # Skip standalone recon when prefix recon is enabled (it already
+                # computes full reconstruction internally, avoiding double decode).
+                if recon_decoders is not None and recon_loss_fn is not None and prefix_recon_loss_fn is None:
                     recons = {}
                     targets = {}
                     for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
