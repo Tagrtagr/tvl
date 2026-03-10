@@ -99,11 +99,13 @@ class ReconstructionLoss(nn.Module):
             if self.perceptual_weight > 0:
                 losses["recon_perceptual_avg"] = total_perceptual / n_modalities
 
+        # Infer device from input tensors for fallback zeros
+        _device = next(iter(targets.values())).device if targets else torch.device("cpu")
         # Total reconstruction loss
-        total = losses.get("recon_pixel_avg", torch.tensor(0.0))
+        total = losses.get("recon_pixel_avg", torch.tensor(0.0, device=_device))
         if self.perceptual_weight > 0:
             total = total + self.perceptual_weight * losses.get(
-                "recon_perceptual_avg", torch.tensor(0.0)
+                "recon_perceptual_avg", torch.tensor(0.0, device=_device)
             )
         losses["recon_total"] = total
 
@@ -219,9 +221,11 @@ class PrefixReconstructionLoss(nn.Module):
         if n_prefix_modalities > 0:
             losses["recon_prefix_avg"] = total_prefix / n_prefix_modalities
 
+        # Infer device from input tensors for fallback zeros
+        _device = next(iter(targets.values())).device if targets else torch.device("cpu")
         # Combined: full + prefix_weight * prefix
-        full_avg = losses.get("recon_full_avg", torch.tensor(0.0))
-        prefix_avg = losses.get("recon_prefix_avg", torch.tensor(0.0))
+        full_avg = losses.get("recon_full_avg", torch.tensor(0.0, device=_device))
+        prefix_avg = losses.get("recon_prefix_avg", torch.tensor(0.0, device=_device))
         losses["recon_total"] = full_avg + self.prefix_weight * prefix_avg
 
         if output_dict:

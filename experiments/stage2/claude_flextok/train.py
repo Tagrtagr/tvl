@@ -808,12 +808,15 @@ if __name__ == "__main__":
     if args.config:
         with open(args.config, "r") as f:
             config = yaml.safe_load(f)
-        # Config overrides defaults but CLI overrides config
-        # (simple merge for now)
+        # Config overrides argparse defaults, but explicit CLI args take precedence.
+        # We re-parse sys.argv to discover which args were explicitly provided.
+        parser = get_args_parser()
+        cli_specified = {action.dest for action in parser._actions
+                         if any(opt in sys.argv for opt in action.option_strings)}
         for section in config.values():
             if isinstance(section, dict):
                 for k, v in section.items():
-                    if hasattr(args, k) and getattr(args, k) is None:
+                    if hasattr(args, k) and k not in cli_specified:
                         setattr(args, k, v)
 
     if args.log_name is not None:

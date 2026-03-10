@@ -248,8 +248,14 @@ def init_distributed_mode(args):
             try:
                 result = subprocess.run(['scontrol', 'show', 'hostnames', node_list],
                                         capture_output=True, text=True)
-                os.environ['MASTER_ADDR'] = result.stdout.strip().split('\n')[0]
-            except Exception:
+                addr = result.stdout.strip().split('\n')[0] if result.returncode == 0 else ''
+                if not addr:
+                    print(f'WARNING: scontrol failed or returned empty for SLURM_NODELIST={node_list}, '
+                          'falling back to localhost')
+                    addr = 'localhost'
+                os.environ['MASTER_ADDR'] = addr
+            except FileNotFoundError:
+                print('WARNING: scontrol not found, falling back to localhost')
                 os.environ['MASTER_ADDR'] = 'localhost'
         if 'MASTER_PORT' not in os.environ:
             os.environ['MASTER_PORT'] = '29500'
