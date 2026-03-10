@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=stage2b-recon
 #SBATCH --partition=viscam
+#SBATCH --account=viscam
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=32G
