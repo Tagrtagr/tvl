@@ -67,7 +67,8 @@ python experiments/stage2/claude_flextok/train.py \
     --use_prefix_recon \
     --prefix_recon_weight 0.5 \
     --epochs 100 \
-    --batch_size 256 \
+    --batch_size 32 \
+    --accum_iter 8 \
     --blr 3e-4 \
     --warmup_epochs 10 \
     --num_workers 10 \
