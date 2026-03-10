@@ -21,7 +21,7 @@ OUTPUT_DIR="experiments/stage2/runs/stage2a_4gpu"
 LOG_NAME="stage2a_4gpu"
 NUM_GPUS=4
 
-cd "$(dirname "$0")/../../../.."
+cd /viscam/u/taarush/tvl
 mkdir -p "$OUTPUT_DIR" logs
 
 echo "Multi-GPU training with $NUM_GPUS GPUs"

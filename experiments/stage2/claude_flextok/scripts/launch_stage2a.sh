@@ -44,7 +44,7 @@ if [ ! -d "$DATASETS_DIR/ssvtp" ]; then
 fi
 
 # ---- Setup ----
-cd "$(dirname "$0")/../../../.."
+cd /viscam/u/taarush/tvl
 mkdir -p "$OUTPUT_DIR" logs
 
 echo "========================================="

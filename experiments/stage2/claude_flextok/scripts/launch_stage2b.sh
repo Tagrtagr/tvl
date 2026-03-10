@@ -29,7 +29,7 @@ OUTPUT_DIR="experiments/stage2/runs/stage2b_recon"
 LOG_NAME="stage2b_recon"
 
 # ---- Setup ----
-cd "$(dirname "$0")/../../../.."
+cd /viscam/u/taarush/tvl
 mkdir -p "$OUTPUT_DIR" logs
 
 # ---- Verify paths (after cd so relative paths resolve) ----
