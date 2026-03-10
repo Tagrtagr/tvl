@@ -5,6 +5,7 @@
 #SBATCH --cpus-per-task=40
 #SBATCH --mem=128G
 #SBATCH --time=12:00:00
+#SBATCH --chdir=/viscam/u/taarush/tvl
 #SBATCH --output=stage2a_4gpu_%j.out
 #SBATCH --error=stage2a_4gpu_%j.err
 
