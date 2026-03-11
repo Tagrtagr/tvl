@@ -27,6 +27,7 @@ Usage:
 
 import argparse
 import json
+import gc
 import os
 import sys
 from pathlib import Path
@@ -85,6 +86,20 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
     base_channels = saved_args.get("recon_base_channels", 64)
     n_decoder_layers = saved_args.get("recon_decoder_layers", 2)
 
+    # Extract only what we need from the checkpoint and free it
+    alignment_state = ckpt.get("alignment_model", {})
+    decoder_states = {}
+    for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+        key = f"recon_decoder_{mod_name}"
+        if key not in ckpt:
+            raise KeyError(
+                f"Checkpoint missing '{key}'. This visualization requires a "
+                "reconstruction checkpoint (from Stage 2b or joint training)."
+            )
+        decoder_states[mod_name] = ckpt[key]
+    del ckpt
+    gc.collect()
+
     frozen_encoder = TVL(
         tactile_model=tactile_model,
         active_modalities=[ModalityType.VISION, ModalityType.TACTILE],
@@ -93,6 +108,8 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
         s1_ckpt = torch.load(stage1_checkpoint, map_location="cpu")
         state = s1_ckpt.get("model", s1_ckpt)
         frozen_encoder.load_state_dict(state, strict=False)
+        del s1_ckpt, state
+        gc.collect()
 
     # Determine input dims from frozen encoder
     vision_dim = frozen_encoder.clip.visual.output_dim if hasattr(frozen_encoder.clip.visual, "output_dim") else 768
@@ -108,20 +125,16 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
     )
     model = Stage2Wrapper(frozen_encoder, alignment_model)
 
-    model.alignment_model.load_state_dict(ckpt.get("alignment_model", {}), strict=False)
+    model.alignment_model.load_state_dict(alignment_state, strict=False)
+    del alignment_state
+    gc.collect()
     model.to(device).eval()
 
     recon_decoders = {}
     for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-        key = f"recon_decoder_{mod_name}"
-        if key not in ckpt:
-            raise KeyError(
-                f"Checkpoint missing '{key}'. This visualization requires a "
-                "reconstruction checkpoint (from Stage 2b or joint training)."
-            )
+        state = decoder_states[mod_name]
         # Detect decoder type from saved state: autoregressive decoders have
         # cross-attention keys while convolutional decoders don't.
-        state = ckpt[key]
         is_autoregressive = any("cross_attn" in k or "spatial_queries" in k for k in state)
         if is_autoregressive:
             dec = AutoregressiveDecoder(
@@ -138,6 +151,8 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
         dec.load_state_dict(state)
         dec.to(device).eval()
         recon_decoders[mod_name] = dec
+    del decoder_states
+    gc.collect()
 
     return model, recon_decoders
 
