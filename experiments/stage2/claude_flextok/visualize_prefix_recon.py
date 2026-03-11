@@ -153,6 +153,10 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
         del s1_ckpt, state
         gc.collect()
 
+    # Convert frozen encoder to float16 to save ~750MB RAM
+    frozen_encoder.half()
+    gc.collect()
+
     # Determine input dims from frozen encoder
     vision_dim = frozen_encoder.clip.visual.output_dim if hasattr(frozen_encoder.clip.visual, "output_dim") else 768
     tactile_dim = frozen_encoder.tactile_encoder.num_classes if frozen_encoder.tactile_encoder.num_classes > 0 else frozen_encoder.tactile_encoder.num_features
@@ -170,7 +174,8 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
     model.alignment_model.load_state_dict(alignment_state, strict=False)
     del alignment_state
     gc.collect()
-    model.to(device).eval()
+    # Use float16 for entire model to minimize memory
+    model.half().to(device).eval()
 
     recon_decoders = {}
     for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
@@ -191,7 +196,7 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
                 n_heads=n_heads,
             )
         dec.load_state_dict(state)
-        dec.to(device).eval()
+        dec.half().to(device).eval()
         recon_decoders[mod_name] = dec
     del decoder_states
     gc.collect()
@@ -224,13 +229,13 @@ def plot_prefix_reconstruction(model, recon_decoders, dataloader, n_registers,
     for k, v in batch.items():
         if isinstance(v, list):
             v = v[0]
-        batch[k] = v.to(device, non_blocking=True)
+        batch[k] = v.to(device=device, dtype=torch.float16, non_blocking=True)
         if batch[k].dim() > 4:
             batch[k] = batch[k].squeeze(1)
 
     prefix_lengths = get_prefix_lengths(n_registers)
 
-    with torch.no_grad(), torch.cuda.amp.autocast():
+    with torch.no_grad(), torch.amp.autocast(device_type=device.split(":")[0], dtype=torch.float16):
         frozen_features = model.frozen_encoder(batch)
         frozen_features.pop("logit_scale", None)
         frozen_features.pop("logit_bias", None)
@@ -250,7 +255,7 @@ def plot_prefix_reconstruction(model, recon_decoders, dataloader, n_registers,
         # Precompute all prefix reconstructions once (avoid redundant batch decoding)
         prefix_recons = {}
         for k in prefix_lengths:
-            with torch.no_grad(), torch.cuda.amp.autocast():
+            with torch.no_grad():
                 prefix_recons[k] = decoder.forward_prefix(all_tokens, k=k)
 
         n_cols = 1 + len(prefix_lengths)  # original + each prefix
@@ -303,11 +308,11 @@ def plot_prefix_mse_curve(model, recon_decoders, dataloader, n_registers,
         for k, v in batch.items():
             if isinstance(v, list):
                 v = v[0]
-            batch[k] = v.to(device, non_blocking=True)
+            batch[k] = v.to(device=device, dtype=torch.float16, non_blocking=True)
             if batch[k].dim() > 4:
                 batch[k] = batch[k].squeeze(1)
 
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad(), torch.amp.autocast(device_type=device.split(":")[0], dtype=torch.float16):
             frozen_features = model.frozen_encoder(batch)
             frozen_features.pop("logit_scale", None)
             frozen_features.pop("logit_bias", None)
@@ -319,7 +324,7 @@ def plot_prefix_mse_curve(model, recon_decoders, dataloader, n_registers,
             target = batch[mod_name]
 
             for k in prefix_lengths:
-                with torch.no_grad(), torch.cuda.amp.autocast():
+                with torch.no_grad():
                     recon = decoder.forward_prefix(all_tokens, k=k)
                 mse = torch.nn.functional.mse_loss(recon.float(), target.float()).item()
                 mse_per_k[mod_name][k].append(mse)
