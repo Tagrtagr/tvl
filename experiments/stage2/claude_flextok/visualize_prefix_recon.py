@@ -66,6 +66,47 @@ def unnormalize(tensor, mean, std):
     return (tensor * std + mean).clamp(0, 1)
 
 
+def _strip_checkpoint(checkpoint_path):
+    """Create a lightweight version of the checkpoint without optimizer/scaler.
+
+    If a stripped version already exists (same path with .stripped.pth),
+    returns its path. Otherwise, loads the checkpoint on a machine with
+    enough RAM, removes optimizer/scaler, and re-saves it.
+    """
+    stripped_path = checkpoint_path.replace(".pth", ".stripped.pth")
+    if os.path.exists(stripped_path):
+        return stripped_path
+
+    print(f"Creating stripped checkpoint (removing optimizer/scaler)...")
+    print(f"This is a one-time operation. Loading: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    for key in ["optimizer", "scaler"]:
+        if key in ckpt:
+            print(f"  Removing '{key}' (freeing memory)")
+            del ckpt[key]
+    gc.collect()
+    torch.save(ckpt, stripped_path)
+    del ckpt
+    gc.collect()
+    print(f"Saved stripped checkpoint: {stripped_path}")
+    return stripped_path
+
+
+def _load_checkpoint_lightweight(checkpoint_path):
+    """Load checkpoint, preferring a stripped version if available."""
+    # Check for pre-stripped version
+    stripped_path = checkpoint_path.replace(".pth", ".stripped.pth")
+    load_path = stripped_path if os.path.exists(stripped_path) else checkpoint_path
+
+    ckpt = torch.load(load_path, map_location="cpu")
+    # Safety: remove heavy keys if they somehow survived
+    for key in ["optimizer", "scaler"]:
+        if key in ckpt:
+            del ckpt[key]
+    gc.collect()
+    return ckpt
+
+
 def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
                              n_shared=8, hidden_dim=512, device="cuda"):
     """Load Stage 2 model + reconstruction decoders from a checkpoint.
@@ -73,7 +114,8 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
     Model parameters are read from the saved run configuration in
     ckpt["args"] when available, falling back to the function defaults.
     """
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    # Selectively load only the keys we need (skip optimizer/scaler to save RAM)
+    ckpt = _load_checkpoint_lightweight(checkpoint_path)
     saved_args = ckpt.get("args", {})
 
     # Read model hyperparameters from checkpoint args, fall back to defaults
@@ -331,8 +373,18 @@ def main():
     parser.add_argument("--n_shared", type=int, default=8,
                         help="n_shared for single checkpoint mode")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--strip_checkpoint", action="store_true",
+                        help="Only strip optimizer/scaler from checkpoint and exit. "
+                             "Run this on a machine with enough RAM first.")
 
     args = parser.parse_args()
+
+    # Strip mode: create lightweight checkpoint and exit
+    if args.strip_checkpoint:
+        if not args.checkpoint:
+            parser.error("--strip_checkpoint requires --checkpoint")
+        _strip_checkpoint(args.checkpoint)
+        sys.exit(0)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     # Load validation data
@@ -344,7 +396,7 @@ def main():
         text_prompt="This image gives tactile feelings of ",
     )
     loader = DataLoader(dataset_val, batch_size=max(args.n_samples, 16),
-                        shuffle=False, num_workers=2)
+                        shuffle=False, num_workers=0)
 
     if args.checkpoint:
         # Single checkpoint mode
