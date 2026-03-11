@@ -283,6 +283,9 @@ def plot_prefix_reconstruction(model, recon_decoders, dataloader, n_registers,
         decoder = recon_decoders[mod_name]
         originals = batch[mod_name]
 
+        # Ensure tokens match decoder dtype (decoder is fp16, tokens may be fp32)
+        all_tokens = all_tokens.to(dtype=next(decoder.parameters()).dtype)
+
         # Clamp n_samples to actual batch size
         n_rows = min(n_samples, originals.shape[0])
 
@@ -356,6 +359,7 @@ def plot_prefix_mse_curve(model, recon_decoders, dataloader, n_registers,
             all_tokens = output[f"{mod_name}_all_tokens"]
             decoder = recon_decoders[mod_name]
             target = batch[mod_name]
+            all_tokens = all_tokens.to(dtype=next(decoder.parameters()).dtype)
 
             for k in prefix_lengths:
                 with torch.no_grad():
