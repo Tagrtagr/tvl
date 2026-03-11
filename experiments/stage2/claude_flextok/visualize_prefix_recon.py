@@ -395,7 +395,7 @@ def main():
         modality_types=[ModalityType.VISION, ModalityType.TACTILE],
         text_prompt="This image gives tactile feelings of ",
     )
-    loader = DataLoader(dataset_val, batch_size=max(args.n_samples, 16),
+    loader = DataLoader(dataset_val, batch_size=args.n_samples,
                         shuffle=False, num_workers=0)
 
     if args.checkpoint:
