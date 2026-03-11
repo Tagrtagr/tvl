@@ -47,11 +47,38 @@ sys.path.insert(0, _here)
 sys.path.insert(0, os.path.join(_here, "../../.."))
 sys.path.insert(0, os.path.join(_here, "../../../tvl_enc"))
 
-from tvl_enc.tacvis import TacVisDataset, RGB_AUGMENTS, TAC_AUGMENTS
-from tvl_enc.tvl import TVL, ModalityType
-from models.cross_modal_alignment import CrossModalAlignmentModel, Stage2Wrapper
-from models.reconstruction_decoder import ReconstructionDecoder
-from models.autoregressive_decoder import AutoregressiveDecoder
+# Deferred imports to reduce peak memory.  These modules pull in open_clip,
+# timm, etc. which together add ~1-2 GB of resident memory.  We import them
+# lazily so that lightweight operations (--strip_checkpoint, arg parsing)
+# don't pay that cost, and so the checkpoint can be loaded before the
+# heaviest libraries are resident.
+TacVisDataset = None
+RGB_AUGMENTS = TAC_AUGMENTS = None
+TVL = None
+ModalityType = None
+CrossModalAlignmentModel = Stage2Wrapper = None
+ReconstructionDecoder = AutoregressiveDecoder = None
+
+
+def _ensure_imports():
+    """Import heavy dependencies on first use."""
+    global TacVisDataset, RGB_AUGMENTS, TAC_AUGMENTS
+    global TVL, ModalityType
+    global CrossModalAlignmentModel, Stage2Wrapper
+    global ReconstructionDecoder, AutoregressiveDecoder
+    if ModalityType is not None:
+        return  # already imported
+
+    from tvl_enc.tacvis import TacVisDataset as _TD, RGB_AUGMENTS as _RA, TAC_AUGMENTS as _TA
+    from tvl_enc.tvl import TVL as _TVL, ModalityType as _MT
+    from models.cross_modal_alignment import CrossModalAlignmentModel as _CMA, Stage2Wrapper as _S2W
+    from models.reconstruction_decoder import ReconstructionDecoder as _RD
+    from models.autoregressive_decoder import AutoregressiveDecoder as _AD
+
+    TacVisDataset, RGB_AUGMENTS, TAC_AUGMENTS = _TD, _RA, _TA
+    TVL, ModalityType = _TVL, _MT
+    CrossModalAlignmentModel, Stage2Wrapper = _CMA, _S2W
+    ReconstructionDecoder, AutoregressiveDecoder = _RD, _AD
 
 # Normalization constants
 RGB_MEAN = np.array([0.48145466, 0.4578275, 0.40821073])
@@ -98,7 +125,12 @@ def _load_checkpoint_lightweight(checkpoint_path):
     stripped_path = checkpoint_path.replace(".pth", ".stripped.pth")
     load_path = stripped_path if os.path.exists(stripped_path) else checkpoint_path
 
-    ckpt = torch.load(load_path, map_location="cpu")
+    # Use mmap=True to avoid loading all tensors into RAM at once
+    try:
+        ckpt = torch.load(load_path, map_location="cpu", mmap=True)
+    except TypeError:
+        # Older PyTorch without mmap support
+        ckpt = torch.load(load_path, map_location="cpu")
     # Safety: remove heavy keys if they somehow survived
     for key in ["optimizer", "scaler"]:
         if key in ckpt:
@@ -114,6 +146,8 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
     Model parameters are read from the saved run configuration in
     ckpt["args"] when available, falling back to the function defaults.
     """
+    _ensure_imports()
+
     # Selectively load only the keys we need (skip optimizer/scaler to save RAM)
     ckpt = _load_checkpoint_lightweight(checkpoint_path)
     saved_args = ckpt.get("args", {})
@@ -384,6 +418,17 @@ def main():
 
     args = parser.parse_args()
 
+    # Print memory info for debugging OOM issues
+    try:
+        import resource
+        import subprocess
+        mem_info = subprocess.check_output(["free", "-h"], text=True)
+        print(f"System memory:\n{mem_info}")
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        print(f"Current process RSS: {rss_kb / 1024:.0f} MB (before model loading)")
+    except Exception:
+        pass
+
     # Strip mode: create lightweight checkpoint and exit
     if args.strip_checkpoint:
         if not args.checkpoint:
@@ -391,6 +436,7 @@ def main():
         _strip_checkpoint(args.checkpoint)
         sys.exit(0)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    _ensure_imports()
 
     # Load validation data
     root_dir = os.path.join(args.datasets_dir, "ssvtp")
