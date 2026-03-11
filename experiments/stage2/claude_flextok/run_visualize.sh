@@ -11,6 +11,7 @@ cd /viscam/u/taarush/tvl
 
 python experiments/stage2/claude_flextok/visualize_prefix_recon.py \
     --checkpoint experiments/stage2/runs/stage2b_recon/stage2b_recon/checkpoint_best.pth \
+    --stage1_checkpoint /viscam/u/taarush/tvl_enc_vittiny.pth \
     --datasets_dir /viscam/u/taarush \
-    --n_samples 2 \
-    --output_dir visualizations/stage2b_prefix
+    --n_samples 4 \
+    --output_dir visualizations/stage2b_prefix_with_s1
