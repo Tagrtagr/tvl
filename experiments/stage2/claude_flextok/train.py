@@ -180,6 +180,11 @@ def get_args_parser():
     parser.add_argument("--resume", default="", type=str)
     parser.add_argument("--start_epoch", default=0, type=int)
 
+    # Debugging: overfit to a single data point
+    parser.add_argument("--overfit_one_sample", action="store_true", default=False,
+                        help="Train on a single data point to verify the network can overfit. "
+                             "Use this to debug reconstruction quality issues.")
+
     # Config file (overrides command line)
     parser.add_argument("--config", type=str, default=None,
                         help="Path to YAML config file")
@@ -250,8 +255,57 @@ def build_datasets(args):
         raise ValueError(f"No datasets found in {args.datasets_dir}")
 
 
+def _validate_stage1_checkpoint(checkpoint_path, tactile_model="vit_tiny_patch16_224"):
+    """Validate that a Stage 1 checkpoint exists and loads correctly.
+
+    Raises clear errors if the checkpoint is missing, corrupted, or doesn't
+    contain the expected encoder weights. This catches a common issue where
+    the checkpoint is saved in a different location than expected, causing
+    the model to train with random (untrained) frozen encoder weights.
+    """
+    if not checkpoint_path:
+        print("\n" + "!" * 60)
+        print("  WARNING: No --stage1_checkpoint provided!")
+        print("  The frozen encoder will use RANDOM weights.")
+        print("  This will produce meaningless alignment results.")
+        print("  Provide the path to your Stage 1 TVL encoder checkpoint.")
+        print("!" * 60 + "\n")
+        return
+
+    if not os.path.exists(checkpoint_path):
+        print("\n" + "!" * 60)
+        print(f"  ERROR: Stage 1 checkpoint NOT FOUND:")
+        print(f"    {checkpoint_path}")
+        print("  The frozen encoder will use RANDOM weights.")
+        print("  Common locations to check:")
+        print("    - /viscam/u/taarush/tvl_enc_vittiny.pth")
+        print("    - ./checkpoints/stage1/checkpoint_best.pth")
+        print("  Check that the file path is correct.")
+        print("!" * 60 + "\n")
+        return
+
+    file_size_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
+    print(f"Stage 1 checkpoint: {checkpoint_path} ({file_size_mb:.1f} MB)")
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+
+    if isinstance(state, dict):
+        has_tactile = any("tactile" in k for k in state.keys())
+        has_clip = any("clip" in k for k in state.keys())
+        n_keys = len(state)
+        print(f"  Contains {n_keys} keys (tactile: {has_tactile}, clip: {has_clip})")
+        if not has_tactile:
+            print("  WARNING: No tactile encoder weights found in checkpoint!")
+    else:
+        print(f"  WARNING: Unexpected checkpoint format: {type(state)}")
+
+
 def build_model(args, device):
     """Build frozen encoder + Stage 2 alignment model."""
+    # Validate Stage 1 checkpoint before loading
+    _validate_stage1_checkpoint(args.stage1_checkpoint, args.tactile_model)
+
     # Build frozen Stage 1 encoder
     frozen_encoder = TVL(
         tactile_model=args.tactile_model,
@@ -263,9 +317,10 @@ def build_model(args, device):
         print(f"Loading Stage 1 checkpoint from {args.stage1_checkpoint}")
         ckpt = torch.load(args.stage1_checkpoint, map_location="cpu")
         if "model" in ckpt:
-            frozen_encoder.load_state_dict(ckpt["model"], strict=False)
+            msg = frozen_encoder.load_state_dict(ckpt["model"], strict=False)
         else:
-            frozen_encoder.load_state_dict(ckpt, strict=False)
+            msg = frozen_encoder.load_state_dict(ckpt, strict=False)
+        print(f"  Loaded (missing: {len(msg.missing_keys)}, unexpected: {len(msg.unexpected_keys)})")
 
     # Determine input dims from the frozen encoder
     # Vision: OpenCLIP ViT-L-14 outputs 768-dim
@@ -587,6 +642,19 @@ def main(args):
 
     # Build datasets
     dataset_train, dataset_val = build_datasets(args)
+
+    # Overfit mode: reduce dataset to a single sample for debugging
+    if getattr(args, "overfit_one_sample", False):
+        print("\n" + "=" * 60)
+        print("  OVERFIT MODE: Training on a single data point")
+        print("  Expected: loss should drop to ~0 within a few epochs")
+        print("=" * 60 + "\n")
+        dataset_train = torch.utils.data.Subset(dataset_train, [0])
+        dataset_val = torch.utils.data.Subset(dataset_val, [0])
+        # Use small batch size and disable nested dropout for clean overfitting
+        args.batch_size = 1
+        args.nested_dropout = False
+        args.warmup_epochs = 0
 
     # Samplers
     if True:  # distributed

@@ -89,6 +89,27 @@ def unnormalize(tensor, mean, std):
     return img.clamp(0, 1)
 
 
+def fix_tactile_orientation(tensor):
+    """Fix 90-degree rotation in tactile reconstructions.
+
+    The decoder can produce tactile outputs that are rotated 90 degrees
+    relative to the original. This applies a counter-clockwise 90-degree
+    rotation to correct the orientation.
+
+    Args:
+        tensor: (C, H, W) or (B, C, H, W) image tensor.
+
+    Returns:
+        Rotation-corrected tensor.
+    """
+    import torch
+    if tensor.ndim == 3:
+        return torch.rot90(tensor, k=-1, dims=[1, 2])
+    elif tensor.ndim == 4:
+        return torch.rot90(tensor, k=-1, dims=[2, 3])
+    return tensor
+
+
 # ─────────────────────────────────────────────────
 # Plot 1: Training curves (accuracy + loss by epoch)
 # ─────────────────────────────────────────────────
@@ -305,6 +326,9 @@ def plot_reconstruction_samples(checkpoint_path, stage1_checkpoint, datasets_dir
         unnormalize(recon_tactile[i].float(), TAC_MEAN, TAC_STD)
         for i in range(n_samples)
     ])
+
+    # Fix 90-degree rotation in tactile reconstructions
+    rec_tactile = fix_tactile_orientation(rec_tactile)
 
     # Plot: 4 rows x n_samples columns
     # Row 1: Original vision

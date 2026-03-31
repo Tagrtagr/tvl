@@ -93,6 +93,19 @@ def unnormalize(tensor, mean, std):
     return (tensor * std + mean).clamp(0, 1)
 
 
+def fix_tactile_orientation(tensor):
+    """Fix 90-degree rotation in tactile reconstructions.
+
+    The decoder can produce tactile outputs rotated 90 degrees relative to
+    the original. This applies a counter-clockwise 90-degree rotation.
+    """
+    if tensor.ndim == 3:
+        return torch.rot90(tensor, k=-1, dims=[1, 2])
+    elif tensor.ndim == 4:
+        return torch.rot90(tensor, k=-1, dims=[2, 3])
+    return tensor
+
+
 def _strip_checkpoint(checkpoint_path):
     """Create a lightweight version of the checkpoint without optimizer/scaler.
 
@@ -293,7 +306,11 @@ def plot_prefix_reconstruction(model, recon_decoders, dataloader, n_registers,
         prefix_recons = {}
         for k in prefix_lengths:
             with torch.no_grad():
-                prefix_recons[k] = decoder.forward_prefix(all_tokens, k=k)
+                recon = decoder.forward_prefix(all_tokens, k=k)
+                # Fix 90-degree rotation in tactile reconstructions
+                if mod_name == ModalityType.TACTILE:
+                    recon = fix_tactile_orientation(recon)
+                prefix_recons[k] = recon
 
         n_cols = 1 + len(prefix_lengths)  # original + each prefix
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.5 * n_cols, 2.5 * n_rows))
@@ -364,6 +381,9 @@ def plot_prefix_mse_curve(model, recon_decoders, dataloader, n_registers,
             for k in prefix_lengths:
                 with torch.no_grad():
                     recon = decoder.forward_prefix(all_tokens, k=k)
+                    # Fix 90-degree rotation in tactile reconstructions
+                    if mod_name == ModalityType.TACTILE:
+                        recon = fix_tactile_orientation(recon)
                 mse = torch.nn.functional.mse_loss(recon.float(), target.float()).item()
                 mse_per_k[mod_name][k].append(mse)
 
