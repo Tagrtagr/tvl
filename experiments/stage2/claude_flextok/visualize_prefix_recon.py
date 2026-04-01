@@ -463,7 +463,12 @@ def main():
     _ensure_imports()
 
     # Load validation data
-    root_dir = os.path.join(args.datasets_dir, "ssvtp")
+    # If datasets_dir already contains images_rgb/ or train.csv, use it directly;
+    # otherwise try the ssvtp/ subdirectory (backwards compat with train.py).
+    root_dir = args.datasets_dir
+    if not (os.path.exists(os.path.join(root_dir, "images_rgb")) or
+            os.path.exists(os.path.join(root_dir, "train.csv"))):
+        root_dir = os.path.join(root_dir, "ssvtp")
     dataset_val = TacVisDataset(
         root_dir=root_dir, split="val",
         transform_rgb=RGB_AUGMENTS, transform_tac=TAC_AUGMENTS,

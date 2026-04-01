@@ -279,7 +279,10 @@ def plot_reconstruction_samples(checkpoint_path, stage1_checkpoint, datasets_dir
         recon_decoders[mod_name] = dec
 
     # Load val data
-    root_dir = os.path.join(datasets_dir, "ssvtp")
+    root_dir = datasets_dir
+    if not (os.path.exists(os.path.join(root_dir, "images_rgb")) or
+            os.path.exists(os.path.join(root_dir, "train.csv"))):
+        root_dir = os.path.join(root_dir, "ssvtp")
     dataset_val = TacVisDataset(
         root_dir=root_dir, split="val",
         transform_rgb=RGB_AUGMENTS, transform_tac=TAC_AUGMENTS,
@@ -432,7 +435,10 @@ def plot_tsne(checkpoint_path, stage1_checkpoint, datasets_dir,
     model.eval()
 
     # Load data
-    root_dir = os.path.join(datasets_dir, "ssvtp")
+    root_dir = datasets_dir
+    if not (os.path.exists(os.path.join(root_dir, "images_rgb")) or
+            os.path.exists(os.path.join(root_dir, "train.csv"))):
+        root_dir = os.path.join(root_dir, "ssvtp")
     dataset_val = TacVisDataset(
         root_dir=root_dir, split="val",
         transform_rgb=RGB_AUGMENTS, transform_tac=TAC_AUGMENTS,
@@ -546,7 +552,10 @@ def plot_variable_length(checkpoint_path, stage1_checkpoint, datasets_dir,
     model.eval()
 
     # Load data
-    root_dir = os.path.join(datasets_dir, "ssvtp")
+    root_dir = datasets_dir
+    if not (os.path.exists(os.path.join(root_dir, "images_rgb")) or
+            os.path.exists(os.path.join(root_dir, "train.csv"))):
+        root_dir = os.path.join(root_dir, "ssvtp")
     dataset_val = TacVisDataset(
         root_dir=root_dir, split="val",
         transform_rgb=RGB_AUGMENTS, transform_tac=TAC_AUGMENTS,
