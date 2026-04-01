@@ -55,6 +55,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset
+from torchvision.utils import save_image
 try:
     from torch.utils.tensorboard import SummaryWriter
     HAS_TENSORBOARD = True
@@ -77,14 +78,17 @@ from tvl_enc.tvl import TVL, ModalityType
 from tvl_enc.tacvis import (
     TacVisDataset, TacVisDatasetV2,
     RGB_AUGMENTS, TAC_AUGMENTS, TAC_AUGMENTS_BG, TAC_AUGMENTS_BG_CJ,
+    RGB_MEAN, RGB_STD, TAC_MEAN, TAC_STD, TAC_MEAN_BG, TAC_STD_BG,
 )
 
 from models.cross_modal_alignment import CrossModalAlignmentModel, Stage2Wrapper
 from models.reconstruction_decoder import ReconstructionDecoder
 from models.autoregressive_decoder import AutoregressiveDecoder
+from models.flow_matching_decoder import FlowMatchingReconstructionDecoder
 from losses.alignment_loss import CrossModalAlignmentLoss
 from losses.flow_matching import FlowMatchingAlignmentLoss
 from losses.reconstruction_loss import ReconstructionLoss, PrefixReconstructionLoss
+from losses.flow_reconstruction_loss import FlowReconstructionLoss
 
 try:
     import wandb
@@ -111,21 +115,28 @@ def get_args_parser():
     # Loss
     parser.add_argument("--loss_type", type=str, default="contrastive",
                         choices=["contrastive", "flow_matching", "combined"])
+    parser.add_argument("--use_flow_matching_alignment_loss", action="store_true", default=False, help="Enable flow-matching alignment loss (optional)")
     parser.add_argument("--contrastive_weight", type=float, default=1.0)
     parser.add_argument("--preservation_weight", type=float, default=0.5)
     parser.add_argument("--flow_weight", type=float, default=0.5)
 
     # Reconstruction
-    parser.add_argument("--use_reconstruction", action="store_true", default=False,
-                        help="Enable reconstruction decoder (FlexTok-style)")
     parser.add_argument("--reconstruction_weight", type=float, default=1.0)
     parser.add_argument("--recon_base_channels", type=int, default=64)
     parser.add_argument("--recon_decoder_layers", type=int, default=2)
     parser.add_argument("--recon_loss_type", type=str, default="mse",
                         choices=["mse", "l1", "smooth_l1"])
+    parser.add_argument("--save_recon_images", action="store_true", default=True,
+                        help="Save reconstructed images during evaluation")
+    parser.add_argument("--recon_save_every", type=int, default=1,
+                        help="Save reconstructions every N eval epochs")
+    parser.add_argument("--recon_save_max_batches", type=int, default=1,
+                        help="Max number of validation batches to save per eval")
+    parser.add_argument("--flow_recon_steps", type=int, default=20,
+                        help="Euler steps for flow-matching reconstruction sampling")
 
     # OAT-style prefix reconstruction (coarse-to-fine ordering)
-    parser.add_argument("--use_prefix_recon", action="store_true", default=False,
+    parser.add_argument("--use_prefix_recon", action="store_true", default=True,
                         help="Enable OAT-style prefix reconstruction loss")
     parser.add_argument("--prefix_recon_weight", type=float, default=0.5,
                         help="Weight for prefix reconstruction relative to full recon")
@@ -144,8 +155,9 @@ def get_args_parser():
     parser.add_argument("--alignment_checkpoint", type=str, default=None,
                         help="Path to alignment stage checkpoint (for --stage reconstruction)")
     parser.add_argument("--decoder_type", type=str, default="autoregressive",
-                        choices=["conv", "autoregressive"],
-                        help="Reconstruction decoder: 'autoregressive' (transformer) or 'conv' (ConvTranspose)")
+                        choices=["conv", "autoregressive", "flow_matching"],
+                        help="Reconstruction decoder: 'autoregressive' (transformer) or 'conv' (ConvTranspose) "
+                             "or 'flow_matching' (rectified-flow conditioned on register tokens)")
 
     # Training
     parser.add_argument("--batch_size", default=256, type=int)
@@ -261,7 +273,7 @@ def build_model(args, device):
     # Load Stage 1 checkpoint if provided
     if args.stage1_checkpoint and os.path.exists(args.stage1_checkpoint):
         print(f"Loading Stage 1 checkpoint from {args.stage1_checkpoint}")
-        ckpt = torch.load(args.stage1_checkpoint, map_location="cpu")
+        ckpt = torch.load(args.stage1_checkpoint, map_location="cpu", weights_only=False)
         if "model" in ckpt:
             frozen_encoder.load_state_dict(ckpt["model"], strict=False)
         else:
@@ -311,7 +323,7 @@ def build_loss(args, device):
     )
 
     flow_loss = None
-    if args.loss_type in ["flow_matching", "combined"]:
+    if getattr(args, "use_flow_matching_alignment_loss", False) and args.loss_type in ["flow_matching", "combined"]:
         flow_loss = FlowMatchingAlignmentLoss(
             modality_names=modality_names,
             embed_dim=args.hidden_dim,
@@ -323,6 +335,73 @@ def build_loss(args, device):
 def _unwrap(model):
     """Unwrap DDP model to access inner attributes."""
     return model.module if hasattr(model, "module") else model
+
+
+def _unnormalize_for_display(x: torch.Tensor, mod_name: str, args) -> torch.Tensor:
+    """Map normalized tensors back to [0,1]-like pixel space for visualization/flow targets."""
+    if mod_name == ModalityType.VISION:
+        mean = torch.tensor(RGB_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        std = torch.tensor(RGB_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    elif mod_name == ModalityType.TACTILE:
+        if getattr(args, "subtract_background", None) == "background":
+            mean_np = TAC_MEAN_BG
+            std_np = TAC_STD_BG
+        else:
+            mean_np = TAC_MEAN
+            std_np = TAC_STD
+        mean = torch.tensor(mean_np, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        std = torch.tensor(std_np, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    else:
+        return x
+    return x * std + mean
+
+
+def _save_recon_images(
+    batch_idx,
+    alignment_output,
+    batch,
+    recon_decoders,
+    output_dir,
+    epoch,
+    stage,
+    args,
+):
+    if recon_decoders is None or output_dir is None:
+        return
+    if not getattr(args, "save_recon_images", False):
+        return
+    if epoch is None:
+        return
+    if args.recon_save_every <= 0:
+        return
+    if epoch % args.recon_save_every != 0:
+        return
+    if batch_idx >= args.recon_save_max_batches:
+        return
+
+    recon_root = Path(output_dir) / "reconstructions" / stage / f"epoch_{epoch:04d}" / f"batch_{batch_idx:03d}"
+    recon_root.mkdir(parents=True, exist_ok=True)
+
+    for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+        all_tokens_key = f"{mod_name}_all_tokens"
+        if all_tokens_key not in alignment_output or mod_name not in batch:
+            continue
+        tokens = alignment_output[all_tokens_key]
+        targets = batch[mod_name]
+        decoder = recon_decoders.get(mod_name)
+        if decoder is None:
+            continue
+
+        if isinstance(_unwrap(decoder), FlowMatchingReconstructionDecoder):
+            recons = _unwrap(decoder).sample(tokens, n_steps=args.flow_recon_steps)
+        else:
+            recons = decoder(tokens)
+
+        targets = torch.clamp(_unnormalize_for_display(targets, mod_name, args), 0.0, 1.0)
+        recons = torch.clamp(_unnormalize_for_display(recons, mod_name, args), 0.0, 1.0)
+
+        save_image(targets, recon_root / f"{mod_name}_target.png", nrow=8)
+        save_image(recons, recon_root / f"{mod_name}_recon.png", nrow=8)
 
 
 def train_one_epoch(
@@ -355,7 +434,7 @@ def train_one_epoch(
         for k, v in samples.items():
             if isinstance(v, list):
                 v = v[0]
-            samples[k] = v.to(device, non_blocking=True).squeeze()
+            samples[k] = v.to(device, non_blocking=True)
 
         stage = getattr(args, "stage", "joint")
 
@@ -399,15 +478,26 @@ def train_one_epoch(
                 # Skip standalone recon when prefix recon is enabled (it already
                 # computes full reconstruction internally, avoiding double decode).
                 if recon_decoders is not None and recon_loss_fn is not None and prefix_recon_loss_fn is None:
-                    recons = {}
                     targets = {}
+                    all_tokens = {}
                     for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
                         all_tokens_key = f"{mod_name}_all_tokens"
                         if all_tokens_key in alignment_output and mod_name in samples:
-                            recons[mod_name] = recon_decoders[mod_name](alignment_output[all_tokens_key])
-                            targets[mod_name] = samples[mod_name]
-                    if recons:
-                        recon_dict = recon_loss_fn(recons, targets)
+                            all_tokens[mod_name] = alignment_output[all_tokens_key]
+                            if isinstance(recon_loss_fn, FlowReconstructionLoss):
+                                targets[mod_name] = _unnormalize_for_display(samples[mod_name], mod_name, args)
+                            else:
+                                targets[mod_name] = samples[mod_name]
+                    if all_tokens:
+                        # Flow-based reconstruction loss trains a conditional rectified-flow decoder
+                        # without needing to explicitly decode full images every step.
+                        if isinstance(recon_loss_fn, FlowReconstructionLoss):
+                            recon_dict = recon_loss_fn(all_tokens, targets, recon_decoders, output_dict=True)
+                        else:
+                            # Pixel-space reconstruction (MSE/L1) needs explicit decoded images
+                            recons = {m: recon_decoders[m](all_tokens[m]) for m in all_tokens}
+                            recon_dict = recon_loss_fn(recons, targets)
+
                         recon_loss = recon_dict["recon_total"]
                         loss = loss + args.reconstruction_weight * recon_loss
                         for k, v in recon_dict.items():
@@ -480,6 +570,7 @@ def train_one_epoch(
 def evaluate(
     data_loader, contrastive_loss_fn, model, device, epoch=None, log_writer=None,
     recon_decoders=None, recon_loss_fn=None, prefix_recon_loss_fn=None, args=None,
+    stage="joint", output_dir=None,
 ):
     metric_logger = misc.MetricLogger(delimiter="  ")
     header = "Test:"
@@ -489,11 +580,12 @@ def evaluate(
         for dec in recon_decoders.values():
             dec.eval()
 
-    for batch in metric_logger.log_every(data_loader, 10, header):
+    import ipdb; ipdb.set_trace()
+    for batch_idx, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
         for k, v in batch.items():
             if isinstance(v, list):
                 v = v[0]
-            batch[k] = v.to(device, non_blocking=True).squeeze()
+            batch[k] = v.to(device, non_blocking=True)
             batch_size = v.shape[0]
 
         with torch.cuda.amp.autocast():
@@ -510,18 +602,36 @@ def evaluate(
             # Reconstruction loss (if enabled)
             # Skip standalone recon when prefix recon is active (mirrors training)
             if recon_decoders is not None and recon_loss_fn is not None and prefix_recon_loss_fn is None:
-                recons = {}
                 targets = {}
+                all_tokens = {}
                 for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
                     all_tokens_key = f"{mod_name}_all_tokens"
                     if all_tokens_key in alignment_output and mod_name in batch:
-                        recons[mod_name] = recon_decoders[mod_name](alignment_output[all_tokens_key])
-                        targets[mod_name] = batch[mod_name]
-                if recons:
-                    recon_dict = recon_loss_fn(recons, targets)
+                        all_tokens[mod_name] = alignment_output[all_tokens_key]
+                        if isinstance(recon_loss_fn, FlowReconstructionLoss):
+                            targets[mod_name] = _unnormalize_for_display(batch[mod_name], mod_name, args)
+                        else:
+                            targets[mod_name] = batch[mod_name]
+                if all_tokens:
+                    if isinstance(recon_loss_fn, FlowReconstructionLoss):
+                        recon_dict = recon_loss_fn(all_tokens, targets, recon_decoders, output_dict=True)
+                    else:
+                        recons = {m: recon_decoders[m](all_tokens[m]) for m in all_tokens}
+                        recon_dict = recon_loss_fn(recons, targets)
                     for k_r, v_r in recon_dict.items():
                         if isinstance(v_r, torch.Tensor):
                             loss_dict[k_r] = v_r
+
+            _save_recon_images(
+                batch_idx,
+                alignment_output,
+                batch,
+                recon_decoders,
+                output_dir,
+                epoch,
+                stage,
+                args,
+            )
 
             # OAT-style prefix reconstruction loss (if enabled)
             if prefix_recon_loss_fn is not None and recon_decoders is not None:
@@ -636,52 +746,70 @@ def main(args):
             p.requires_grad = False
         n_frozen = sum(p.numel() for p in model_without_ddp.alignment_model.parameters())
         print(f"Froze alignment model ({n_frozen:,} params) for reconstruction stage")
-        args.use_reconstruction = True
     elif stage == "alignment":
-        args.use_reconstruction = False
-        print("Alignment stage: reconstruction disabled")
+        args.decoder_type = "flow_matching"
+        print("Alignment stage: register-token alignment only")
 
     # Build reconstruction decoders (if enabled)
     recon_decoders = None
     recon_loss_fn = None
     prefix_recon_loss_fn = None
-    if args.use_reconstruction:
-        recon_decoders = {}
-        decoder_type = getattr(args, "decoder_type", "autoregressive")
-        if decoder_type == "autoregressive":
-            for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-                recon_decoders[mod_name] = AutoregressiveDecoder(
-                    n_registers=args.n_registers,
-                    hidden_dim=args.hidden_dim,
-                    base_channels=args.recon_base_channels,
-                    n_decoder_layers=args.recon_decoder_layers,
-                    n_heads=args.n_heads,
-                ).to(device)
-        else:
-            for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-                recon_decoders[mod_name] = ReconstructionDecoder(
-                    n_registers=args.n_registers,
-                    hidden_dim=args.hidden_dim,
-                    base_channels=args.recon_base_channels,
-                    n_decoder_layers=args.recon_decoder_layers,
-                    n_heads=args.n_heads,
-                ).to(device)
-        recon_loss_fn = ReconstructionLoss(loss_type=args.recon_loss_type)
-        n_decoder_params = sum(
-            sum(p.numel() for p in dec.parameters())
-            for dec in recon_decoders.values()
-        )
-        print(f"Reconstruction decoders: {n_decoder_params:,} parameters ({len(recon_decoders)} modalities)")
 
-        # OAT-style prefix reconstruction loss
-        use_prefix = getattr(args, "use_prefix_recon", False)
-        if use_prefix:
-            prefix_weight = getattr(args, "prefix_recon_weight", 0.5)
-            prefix_recon_loss_fn = PrefixReconstructionLoss(
-                loss_type=args.recon_loss_type,
-                prefix_weight=prefix_weight,
-            )
-            print(f"OAT-style prefix reconstruction enabled (weight={prefix_weight})")
+    recon_decoders = {}
+    decoder_type = getattr(args, "decoder_type", "autoregressive")
+    if decoder_type == "flow_matching" and getattr(args, "use_prefix_recon", False):
+        raise ValueError("--use_prefix_recon is incompatible with --decoder_type flow_matching")
+    if decoder_type == "flow_matching" and args.recon_loss_type != "mse":
+        raise ValueError("--decoder_type flow_matching requires --recon_loss_type mse")
+    if decoder_type == "autoregressive":
+        for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+            recon_decoders[mod_name] = AutoregressiveDecoder(
+                n_registers=args.n_registers,
+                hidden_dim=args.hidden_dim,
+                base_channels=args.recon_base_channels,
+                n_decoder_layers=args.recon_decoder_layers,
+                n_heads=args.n_heads,
+            ).to(device)
+    elif decoder_type == "flow_matching":
+        for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+            recon_decoders[mod_name] = FlowMatchingReconstructionDecoder(
+                n_registers=args.n_registers,
+                hidden_dim=args.hidden_dim,
+                base_channels=args.recon_base_channels,
+                n_decoder_layers=args.recon_decoder_layers,
+                n_heads=args.n_heads,
+            ).to(device)
+    else:
+        for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+            recon_decoders[mod_name] = ReconstructionDecoder(
+                n_registers=args.n_registers,
+                hidden_dim=args.hidden_dim,
+                base_channels=args.recon_base_channels,
+                n_decoder_layers=args.recon_decoder_layers,
+                n_heads=args.n_heads,
+            ).to(device)
+    # Choose reconstruction objective based on decoder type.
+    # Pixel losses (mse/l1/smooth_l1) are used for conv/autoregressive decoders.
+    # Flow-matching decoder is trained with a rectified-flow loss in pixel space.
+    if decoder_type == "flow_matching":
+        recon_loss_fn = FlowReconstructionLoss(loss_type=args.recon_loss_type)
+    else:
+        recon_loss_fn = ReconstructionLoss(loss_type=args.recon_loss_type)
+    n_decoder_params = sum(
+        sum(p.numel() for p in dec.parameters())
+        for dec in recon_decoders.values()
+    )
+    print(f"Reconstruction decoders: {n_decoder_params:,} parameters ({len(recon_decoders)} modalities)")
+
+    # OAT-style prefix reconstruction loss
+    use_prefix = getattr(args, "use_prefix_recon", False)
+    if use_prefix:
+        prefix_weight = getattr(args, "prefix_recon_weight", 0.5)
+        prefix_recon_loss_fn = PrefixReconstructionLoss(
+            loss_type=args.recon_loss_type,
+            prefix_weight=prefix_weight,
+        )
+        print(f"OAT-style prefix reconstruction enabled (weight={prefix_weight})")
 
     # Logging
     if global_rank == 0 and args.log_dir is not None and HAS_TENSORBOARD:
@@ -777,7 +905,8 @@ def main(args):
         val_stats = evaluate(data_loader_val, contrastive_loss_fn, model, device,
                              epoch=epoch, log_writer=log_writer,
                              recon_decoders=recon_decoders, recon_loss_fn=recon_loss_fn,
-                             prefix_recon_loss_fn=prefix_recon_loss_fn, args=args)
+                             prefix_recon_loss_fn=prefix_recon_loss_fn, args=args,
+                             stage=stage, output_dir=args.output_dir)
 
         acc1 = val_stats.get("acc1", 0.0)
         recon_loss_val = val_stats.get("recon_total", val_stats.get("recon_pixel_avg", float("inf")))
@@ -849,6 +978,8 @@ if __name__ == "__main__":
         for section in config.values():
             if isinstance(section, dict):
                 for k, v in section.items():
+                    if k == "base_lr":
+                        k = "blr"
                     if hasattr(args, k) and k not in cli_specified:
                         setattr(args, k, v)
 

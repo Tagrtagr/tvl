@@ -1,2 +1,3 @@
 from .alignment_loss import CrossModalAlignmentLoss
 from .flow_matching import FlowMatchingAlignmentLoss
+from .flow_reconstruction_loss import FlowReconstructionLoss
