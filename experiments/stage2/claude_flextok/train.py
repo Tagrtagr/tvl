@@ -389,6 +389,12 @@ def train_one_epoch(
     # Keep frozen encoder in eval mode
     model_inner = _unwrap(model)
     model_inner.frozen_encoder.eval()
+    # In reconstruction stage, the alignment model must also be in eval mode
+    # so that nested dropout and regular dropout are disabled. Otherwise the
+    # decoder receives randomly-varying register tokens each step and can
+    # never learn a consistent mapping (outputs pure noise).
+    if getattr(args, "stage", "joint") == "reconstruction":
+        model_inner.alignment_model.eval()
     if recon_decoders is not None:
         for dec in recon_decoders.values():
             dec.train()
