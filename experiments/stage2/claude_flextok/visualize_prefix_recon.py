@@ -94,10 +94,13 @@ def unnormalize(tensor, mean, std):
 
 
 def fix_tactile_orientation(tensor):
-    """Fix 90-degree rotation in tactile reconstructions.
+    """Undo the 90-degree rotation from tac_padding() for display purposes.
 
-    The decoder can produce tactile outputs rotated 90 degrees relative to
-    the original. This applies a counter-clockwise 90-degree rotation.
+    tac_padding() rotates all tactile images by 90 degrees before they enter
+    the pipeline. Both the reconstruction target AND the decoder output are
+    in this rotated space. This function undoes the rotation for human
+    viewing only — apply it to BOTH target and reconstruction equally, or
+    to neither.
     """
     if tensor.ndim == 3:
         return torch.rot90(tensor, k=-1, dims=[1, 2])
@@ -302,12 +305,16 @@ def plot_prefix_reconstruction(model, recon_decoders, dataloader, n_registers,
         # Clamp n_samples to actual batch size
         n_rows = min(n_samples, originals.shape[0])
 
+        # Undo tac_padding 90° rotation for display (apply to both original and recon)
+        if mod_name == ModalityType.TACTILE:
+            originals = fix_tactile_orientation(originals)
+
         # Precompute all prefix reconstructions once (avoid redundant batch decoding)
         prefix_recons = {}
         for k in prefix_lengths:
             with torch.no_grad():
                 recon = decoder.forward_prefix(all_tokens, k=k)
-                # Fix 90-degree rotation in tactile reconstructions
+                # Apply same orientation fix to reconstruction as to original
                 if mod_name == ModalityType.TACTILE:
                     recon = fix_tactile_orientation(recon)
                 prefix_recons[k] = recon
@@ -381,9 +388,7 @@ def plot_prefix_mse_curve(model, recon_decoders, dataloader, n_registers,
             for k in prefix_lengths:
                 with torch.no_grad():
                     recon = decoder.forward_prefix(all_tokens, k=k)
-                    # Fix 90-degree rotation in tactile reconstructions
-                    if mod_name == ModalityType.TACTILE:
-                        recon = fix_tactile_orientation(recon)
+                # MSE is rotation-invariant, no need to fix orientation here
                 mse = torch.nn.functional.mse_loss(recon.float(), target.float()).item()
                 mse_per_k[mod_name][k].append(mse)
 

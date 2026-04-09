@@ -256,6 +256,129 @@ def check_orientation(batch, output_dir):
     print(f"  Saved orientation check: {path}")
 
 
+def check_pipeline_roundtrip(output_dir, datasets_dir):
+    """End-to-end roundtrip: load raw → preprocess → unnormalize → compare.
+
+    This is the key sanity check from the meeting: if we preprocess a raw
+    image and immediately invert the preprocessing, we should get back the
+    original (no rotation, no scale change, no color shift).
+
+    Also checks that the tactile tac_padding rotation is handled consistently.
+    """
+    from tvl_enc.tacvis import (
+        RGB_PREPROCESS, TAC_PREPROCESS, tac_padding,
+        TacVisDataset,
+    )
+    from PIL import Image
+
+    os.makedirs(output_dir, exist_ok=True)
+    print("\n  Loading a raw sample to trace the full pipeline...")
+
+    # Load dataset to get file paths
+    root_dir = os.path.join(datasets_dir, "ssvtp")
+    dataset = TacVisDataset(
+        root_dir=root_dir, split="val",
+        transform_rgb=RGB_PREPROCESS, transform_tac=TAC_PREPROCESS,
+        modality_types=[ModalityType.VISION, ModalityType.TACTILE],
+        text_prompt="This image gives tactile feelings of ",
+    )
+
+    # Get first sample through dataset pipeline (deterministic, no augmentation)
+    sample = dataset[0]
+    vis_tensor = sample[ModalityType.VISION]
+    tac_tensor = sample[ModalityType.TACTILE]
+    if isinstance(vis_tensor, list):
+        vis_tensor = vis_tensor[0]
+    if isinstance(tac_tensor, list):
+        tac_tensor = tac_tensor[0]
+    vis_tensor = vis_tensor.squeeze()
+    tac_tensor = tac_tensor.squeeze()
+
+    # Also load the raw images for comparison
+    img_path = dataset.paths[0]
+    tac_path = dataset.get_tactile_path(img_path)
+
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    fig.suptitle("End-to-End Pipeline Roundtrip Check\n"
+                 "Raw → Preprocess → Unnormalize should ≈ match the raw image",
+                 fontsize=13, fontweight="bold")
+
+    # --- Vision row ---
+    # Raw image
+    try:
+        raw_vis = Image.open(img_path).convert("RGB")
+        axes[0, 0].imshow(raw_vis)
+        axes[0, 0].set_title(f"Raw Vision\n{raw_vis.size}", fontsize=9)
+    except Exception as e:
+        axes[0, 0].set_title(f"Raw load failed:\n{e}", fontsize=8)
+    axes[0, 0].axis("off")
+
+    # Normalized tensor (rescaled for display)
+    vis_display = vis_tensor.permute(1, 2, 0).numpy()
+    vis_display = (vis_display - vis_display.min()) / (vis_display.max() - vis_display.min() + 1e-8)
+    axes[0, 1].imshow(vis_display)
+    axes[0, 1].set_title(f"Normalized\nrange=[{vis_tensor.min():.2f}, {vis_tensor.max():.2f}]", fontsize=9)
+    axes[0, 1].axis("off")
+
+    # Unnormalized (should look like resized raw)
+    vis_unnorm = unnormalize(vis_tensor, RGB_MEAN, RGB_STD)
+    axes[0, 2].imshow(vis_unnorm.permute(1, 2, 0).numpy())
+    axes[0, 2].set_title(f"Unnormalized\nrange=[{vis_unnorm.min():.2f}, {vis_unnorm.max():.2f}]", fontsize=9)
+    axes[0, 2].axis("off")
+
+    # Per-channel stats
+    stats_text = "Per-channel (unnorm):\n"
+    for c, name in enumerate(["R", "G", "B"]):
+        ch = vis_unnorm[c]
+        stats_text += f"  {name}: [{ch.min():.3f}, {ch.max():.3f}] μ={ch.mean():.3f}\n"
+    axes[0, 3].text(0.1, 0.5, stats_text, fontsize=9, family="monospace",
+                     transform=axes[0, 3].transAxes, verticalalignment="center")
+    axes[0, 3].set_title("Vision Stats", fontsize=9)
+    axes[0, 3].axis("off")
+
+    # --- Tactile row ---
+    try:
+        raw_tac = Image.open(tac_path).convert("RGB")
+        axes[1, 0].imshow(raw_tac)
+        axes[1, 0].set_title(f"Raw Tactile\n{raw_tac.size}", fontsize=9)
+    except Exception as e:
+        axes[1, 0].set_title(f"Raw load failed:\n{e}", fontsize=8)
+    axes[1, 0].axis("off")
+
+    tac_display = tac_tensor.permute(1, 2, 0).numpy()
+    tac_display = (tac_display - tac_display.min()) / (tac_display.max() - tac_display.min() + 1e-8)
+    axes[1, 1].imshow(tac_display)
+    axes[1, 1].set_title(f"Normalized\nrange=[{tac_tensor.min():.2f}, {tac_tensor.max():.2f}]", fontsize=9)
+    axes[1, 1].axis("off")
+
+    tac_unnorm = unnormalize(tac_tensor, TAC_MEAN, TAC_STD)
+    axes[1, 2].imshow(tac_unnorm.permute(1, 2, 0).numpy())
+    axes[1, 2].set_title(f"Unnormalized\nrange=[{tac_unnorm.min():.2f}, {tac_unnorm.max():.2f}]", fontsize=9)
+    axes[1, 2].axis("off")
+
+    stats_text = "Per-channel (unnorm):\n"
+    for c, name in enumerate(["R", "G", "B"]):
+        ch = tac_unnorm[c]
+        stats_text += f"  {name}: [{ch.min():.3f}, {ch.max():.3f}] μ={ch.mean():.3f}\n"
+    stats_text += f"\nNote: tac_padding applies\n90° rotation before transforms"
+    axes[1, 3].text(0.1, 0.5, stats_text, fontsize=9, family="monospace",
+                     transform=axes[1, 3].transAxes, verticalalignment="center")
+    axes[1, 3].set_title("Tactile Stats", fontsize=9)
+    axes[1, 3].axis("off")
+
+    plt.tight_layout()
+    path = os.path.join(output_dir, "pipeline_roundtrip.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved pipeline roundtrip: {path}")
+
+    # Print numerical comparison
+    print(f"\n  Vision  - normalized: [{vis_tensor.min():.4f}, {vis_tensor.max():.4f}]"
+          f"  →  unnormalized: [{vis_unnorm.min():.4f}, {vis_unnorm.max():.4f}]")
+    print(f"  Tactile - normalized: [{tac_tensor.min():.4f}, {tac_tensor.max():.4f}]"
+          f"  →  unnormalized: [{tac_unnorm.min():.4f}, {tac_unnorm.max():.4f}]")
+
+
 def main():
     parser = argparse.ArgumentParser("Data Preprocessing Validation")
     parser.add_argument("--datasets_dir", type=str, required=True)
@@ -323,7 +446,13 @@ def main():
     print("-" * 40)
     check_orientation(batch, args.output_dir)
 
-    # Check 6: Stage 1 checkpoint
+    # Check 6: End-to-end pipeline roundtrip (deterministic, no augmentation)
+    print("\n" + "-" * 40)
+    print("  CHECK 6: Pipeline Roundtrip (preprocess → unnormalize → compare)")
+    print("-" * 40)
+    check_pipeline_roundtrip(args.output_dir, args.datasets_dir)
+
+    # Check 7: Stage 1 checkpoint
     if args.stage1_checkpoint:
         validate_stage1_checkpoint(args.stage1_checkpoint)
 

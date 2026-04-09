@@ -77,6 +77,8 @@ from tvl_enc.tvl import TVL, ModalityType
 from tvl_enc.tacvis import (
     TacVisDataset, TacVisDatasetV2,
     RGB_AUGMENTS, TAC_AUGMENTS, TAC_AUGMENTS_BG, TAC_AUGMENTS_BG_CJ,
+    RGB_PREPROCESS, TAC_PREPROCESS,
+    RGB_MEAN, RGB_STD, TAC_MEAN, TAC_STD,
 )
 
 from models.cross_modal_alignment import CrossModalAlignmentModel, Stage2Wrapper
@@ -255,6 +257,102 @@ def build_datasets(args):
         raise ValueError(f"No datasets found in {args.datasets_dir}")
 
 
+def _sanity_check_preprocessing(dataset, device="cpu"):
+    """End-to-end sanity check: preprocess → unnormalize → verify roundtrip.
+
+    Runs at training startup to catch normalization/scaling bugs early.
+    Checks:
+      1. Normalized tensor value ranges are reasonable
+      2. Unnormalization roundtrip produces valid [0,1] pixel values
+      3. Vision and tactile tensor shapes are correct (3, 224, 224)
+      4. No all-black or all-white images after unnormalization
+    """
+    print("\n" + "=" * 60)
+    print("  PREPROCESSING SANITY CHECK")
+    print("=" * 60)
+
+    sample = dataset[0]
+    ok = True
+
+    for mod_name, mean, std, label in [
+        (ModalityType.VISION, RGB_MEAN, RGB_STD, "Vision"),
+        (ModalityType.TACTILE, TAC_MEAN, TAC_STD, "Tactile"),
+    ]:
+        if mod_name not in sample:
+            continue
+        tensor = sample[mod_name]
+        if isinstance(tensor, list):
+            tensor = tensor[0]
+        tensor = tensor.squeeze()
+
+        # Shape check
+        if tensor.shape != (3, 224, 224):
+            print(f"  [{label}] *** SHAPE ERROR: expected (3,224,224), got {tuple(tensor.shape)} ***")
+            ok = False
+        else:
+            print(f"  [{label}] Shape: {tuple(tensor.shape)} ✓")
+
+        # Normalized value range
+        vmin, vmax = tensor.min().item(), tensor.max().item()
+        vmean, vstd = tensor.mean().item(), tensor.std().item()
+        print(f"  [{label}] Normalized range: [{vmin:.3f}, {vmax:.3f}], mean={vmean:.3f}, std={vstd:.3f}")
+        if vmax > 200:
+            print(f"  [{label}] *** ERROR: values in [0,255] range — missing /255 normalization ***")
+            ok = False
+        if abs(vmax - vmin) < 0.01:
+            print(f"  [{label}] *** ERROR: near-constant tensor — data not loaded properly ***")
+            ok = False
+
+        # Unnormalization roundtrip
+        t_mean = torch.tensor(mean, dtype=tensor.dtype).view(3, 1, 1)
+        t_std = torch.tensor(std, dtype=tensor.dtype).view(3, 1, 1)
+        unnormed = (tensor * t_std + t_mean).clamp(0, 1)
+        u_min, u_max = unnormed.min().item(), unnormed.max().item()
+        print(f"  [{label}] Unnormalized range: [{u_min:.3f}, {u_max:.3f}]")
+
+        # Check for all-black or all-white
+        if u_max < 0.05:
+            print(f"  [{label}] *** ERROR: unnormalized image is all black ***")
+            ok = False
+        if u_min > 0.95:
+            print(f"  [{label}] *** ERROR: unnormalized image is all white ***")
+            ok = False
+
+        # Check clipping percentage
+        pre_clamp = tensor * t_std + t_mean
+        n_clipped = ((pre_clamp < 0).sum() + (pre_clamp > 1).sum()).item()
+        n_total = pre_clamp.numel()
+        clip_pct = 100 * n_clipped / n_total
+        if clip_pct > 30:
+            print(f"  [{label}] *** WARNING: {clip_pct:.1f}% pixels clipped during unnormalization ***")
+        else:
+            print(f"  [{label}] Clipping: {clip_pct:.1f}% ✓")
+
+    print(f"  Result: {'PASS' if ok else 'FAIL — check errors above'}")
+    print("=" * 60 + "\n")
+    return ok
+
+
+def _sanity_check_reconstruction(recon, target, mod_name, step):
+    """Log reconstruction quality metrics during training (called periodically).
+
+    Helps detect scaling mismatches, shape errors, and convergence issues.
+    """
+    if step % 50 != 0:
+        return
+    with torch.no_grad():
+        mse = F.mse_loss(recon, target).item()
+        recon_min, recon_max = recon.min().item(), recon.max().item()
+        recon_mean, recon_std = recon.mean().item(), recon.std().item()
+        target_min, target_max = target.min().item(), target.max().item()
+        target_mean, target_std = target.mean().item(), target.std().item()
+        print(f"  [recon_sanity/{mod_name}] step={step} MSE={mse:.6f}")
+        print(f"    recon  range=[{recon_min:.3f}, {recon_max:.3f}] mean={recon_mean:.3f} std={recon_std:.3f}")
+        print(f"    target range=[{target_min:.3f}, {target_max:.3f}] mean={target_mean:.3f} std={target_std:.3f}")
+        if recon.shape != target.shape:
+            print(f"    *** SHAPE MISMATCH: recon={recon.shape} target={target.shape} ***")
+
+
 def _validate_stage1_checkpoint(checkpoint_path, tactile_model="vit_tiny_patch16_224"):
     """Validate that a Stage 1 checkpoint exists and loads correctly.
 
@@ -301,6 +399,30 @@ def _validate_stage1_checkpoint(checkpoint_path, tactile_model="vit_tiny_patch16
         print(f"  WARNING: Unexpected checkpoint format: {type(state)}")
 
 
+def _validate_loaded_weights(module, name):
+    """Spot-check a few parameter tensors to confirm they are not random.
+
+    Random init typically has small std and near-zero mean. Trained weights
+    have larger values and non-trivial structure. This catches silent
+    fallbacks to random initialization (e.g., wrong checkpoint path).
+    """
+    print(f"\n  Weight validation for '{name}':")
+    checked = 0
+    for param_name, param in module.named_parameters():
+        if checked >= 3:
+            break
+        if param.numel() < 10:
+            continue
+        pmean = param.data.mean().item()
+        pstd = param.data.std().item()
+        pmin = param.data.min().item()
+        pmax = param.data.max().item()
+        print(f"    {param_name}: mean={pmean:.6f} std={pstd:.6f} range=[{pmin:.4f}, {pmax:.4f}]")
+        checked += 1
+    if checked == 0:
+        print(f"    (no parameters found)")
+
+
 def build_model(args, device):
     """Build frozen encoder + Stage 2 alignment model."""
     # Validate Stage 1 checkpoint before loading
@@ -316,11 +438,14 @@ def build_model(args, device):
     if args.stage1_checkpoint and os.path.exists(args.stage1_checkpoint):
         print(f"Loading Stage 1 checkpoint from {args.stage1_checkpoint}")
         ckpt = torch.load(args.stage1_checkpoint, map_location="cpu")
-        if "model" in ckpt:
-            msg = frozen_encoder.load_state_dict(ckpt["model"], strict=False)
-        else:
-            msg = frozen_encoder.load_state_dict(ckpt, strict=False)
+        state = ckpt["model"] if "model" in ckpt else ckpt
+        msg = frozen_encoder.load_state_dict(state, strict=False)
         print(f"  Loaded (missing: {len(msg.missing_keys)}, unexpected: {len(msg.unexpected_keys)})")
+        if msg.missing_keys:
+            print(f"  Missing keys (first 5): {msg.missing_keys[:5]}")
+
+        # Validate: sample weight values to confirm non-random initialization
+        _validate_loaded_weights(frozen_encoder, "frozen_encoder")
 
     # Determine input dims from the frozen encoder
     # Vision: OpenCLIP ViT-L-14 outputs 768-dim
@@ -418,6 +543,15 @@ def train_one_epoch(
                 v = v[0]
             samples[k] = v.to(device, non_blocking=True).squeeze()
 
+        # First-iteration shape validation
+        if data_iter_step == 0 and epoch == 0:
+            for k, v in samples.items():
+                if isinstance(v, torch.Tensor) and v.ndim >= 3:
+                    print(f"  [shape_check] {k}: {tuple(v.shape)}")
+                    # Expect (B, 3, 224, 224) or (3, 224, 224) for batch_size=1
+                    if v.shape[-3:] != (3, 224, 224) and v.shape[-2:] != (224, 224):
+                        print(f"  *** WARNING: unexpected shape for {k}: {tuple(v.shape)} ***")
+
         stage = getattr(args, "stage", "joint")
 
         with torch.cuda.amp.autocast():
@@ -468,6 +602,12 @@ def train_one_epoch(
                             recons[mod_name] = recon_decoders[mod_name](alignment_output[all_tokens_key])
                             targets[mod_name] = samples[mod_name]
                     if recons:
+                        # Periodic sanity check on reconstruction outputs
+                        for mod_name in recons:
+                            _sanity_check_reconstruction(
+                                recons[mod_name], targets[mod_name],
+                                mod_name, data_iter_step,
+                            )
                         recon_dict = recon_loss_fn(recons, targets)
                         recon_loss = recon_dict["recon_total"]
                         loss = loss + args.reconstruction_weight * recon_loss
@@ -653,14 +793,26 @@ def main(args):
     if getattr(args, "overfit_one_sample", False):
         print("\n" + "=" * 60)
         print("  OVERFIT MODE: Training on a single data point")
+        print("  Augmentations DISABLED for deterministic input")
         print("  Expected: loss should drop to ~0 within a few epochs")
+        print("  If it doesn't, there's a bug in architecture/loss/data pipeline")
         print("=" * 60 + "\n")
-        dataset_train = torch.utils.data.Subset(dataset_train, [0])
-        dataset_val = torch.utils.data.Subset(dataset_val, [0])
-        # Use small batch size and disable nested dropout for clean overfitting
+        # Rebuild dataset without augmentations so the network sees the exact
+        # same image every iteration (augmentations would change the target
+        # each step, preventing true overfitting).
+        root_dir = os.path.join(args.datasets_dir, "ssvtp")
+        dataset_overfit = TacVisDataset(
+            root_dir=root_dir, split="train",
+            transform_rgb=RGB_PREPROCESS, transform_tac=TAC_PREPROCESS,
+            modality_types=[ModalityType.VISION, ModalityType.TACTILE],
+            text_prompt="This image gives tactile feelings of ",
+        )
+        dataset_train = torch.utils.data.Subset(dataset_overfit, [0])
+        dataset_val = torch.utils.data.Subset(dataset_overfit, [0])
         args.batch_size = 1
         args.nested_dropout = False
         args.warmup_epochs = 0
+        args.num_workers = 0  # avoid multiprocessing issues with tiny dataset
 
     # Samplers
     if True:  # distributed
@@ -676,10 +828,11 @@ def main(args):
         else:
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
+    overfit = getattr(args, "overfit_one_sample", False)
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        pin_memory=args.pin_mem, drop_last=True,
+        pin_memory=args.pin_mem, drop_last=not overfit,
     )
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler_val,
@@ -703,9 +856,14 @@ def main(args):
         align_ckpt = torch.load(args.alignment_checkpoint, map_location="cpu")
         if "alignment_model" not in align_ckpt:
             raise KeyError("alignment checkpoint is missing 'alignment_model' key")
-        model_without_ddp.alignment_model.load_state_dict(
+        msg = model_without_ddp.alignment_model.load_state_dict(
             align_ckpt["alignment_model"], strict=False,
         )
+        print(f"  Loaded alignment (missing: {len(msg.missing_keys)}, unexpected: {len(msg.unexpected_keys)})")
+        if msg.missing_keys:
+            print(f"  Missing keys: {msg.missing_keys[:5]}")
+        _validate_loaded_weights(model_without_ddp.alignment_model, "alignment_model")
+
         for p in model_without_ddp.alignment_model.parameters():
             p.requires_grad = False
         n_frozen = sum(p.numel() for p in model_without_ddp.alignment_model.parameters())
@@ -831,6 +989,9 @@ def main(args):
                     dec.load_state_dict(ckpt[key])
                     print(f"  Loaded reconstruction decoder for {mod_name}")
         args.start_epoch = ckpt.get("epoch", 0) + 1
+
+    # Run preprocessing sanity check before training starts
+    _sanity_check_preprocessing(dataset_train)
 
     # Training loop
     print(f"Start training for {args.epochs} epochs")

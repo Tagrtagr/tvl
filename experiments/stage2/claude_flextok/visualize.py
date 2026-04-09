@@ -330,7 +330,8 @@ def plot_reconstruction_samples(checkpoint_path, stage1_checkpoint, datasets_dir
         for i in range(n_samples)
     ])
 
-    # Fix 90-degree rotation in tactile reconstructions
+    # Undo tac_padding 90° rotation for display — apply to BOTH original and recon
+    orig_tactile = fix_tactile_orientation(orig_tactile)
     rec_tactile = fix_tactile_orientation(rec_tactile)
 
     # Plot: 4 rows x n_samples columns
