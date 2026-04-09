@@ -709,6 +709,7 @@ def main(args):
         for p in model_without_ddp.alignment_model.parameters():
             p.requires_grad = False
         n_frozen = sum(p.numel() for p in model_without_ddp.alignment_model.parameters())
+        model_without_ddp.alignment_model.eval()
         print(f"Froze alignment model ({n_frozen:,} params) for reconstruction stage")
         args.use_reconstruction = True
     elif stage == "alignment":
