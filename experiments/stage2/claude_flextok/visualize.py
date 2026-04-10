@@ -89,6 +89,27 @@ def unnormalize(tensor, mean, std):
     return img.clamp(0, 1)
 
 
+def fix_tactile_orientation(tensor):
+    """Fix 90-degree rotation in tactile reconstructions.
+
+    The decoder can produce tactile outputs that are rotated 90 degrees
+    relative to the original. This applies a counter-clockwise 90-degree
+    rotation to correct the orientation.
+
+    Args:
+        tensor: (C, H, W) or (B, C, H, W) image tensor.
+
+    Returns:
+        Rotation-corrected tensor.
+    """
+    import torch
+    if tensor.ndim == 3:
+        return torch.rot90(tensor, k=-1, dims=[1, 2])
+    elif tensor.ndim == 4:
+        return torch.rot90(tensor, k=-1, dims=[2, 3])
+    return tensor
+
+
 # ─────────────────────────────────────────────────
 # Plot 1: Training curves (accuracy + loss by epoch)
 # ─────────────────────────────────────────────────
@@ -193,6 +214,14 @@ def plot_training_curves(contrastive_log, recon_log, output_dir):
     print(f"Saved: {path}")
 
 
+def resolve_dataset_root(datasets_dir):
+    """Return the actual SSVTP root, handling both flat and nested layouts."""
+    if (os.path.exists(os.path.join(datasets_dir, "images_rgb")) or
+            os.path.exists(os.path.join(datasets_dir, "train.csv"))):
+        return datasets_dir
+    return os.path.join(datasets_dir, "ssvtp")
+
+
 # ─────────────────────────────────────────────────
 # Plot 2: Reconstruction samples (original vs reconstructed)
 # ─────────────────────────────────────────────────
@@ -258,7 +287,7 @@ def plot_reconstruction_samples(checkpoint_path, stage1_checkpoint, datasets_dir
         recon_decoders[mod_name] = dec
 
     # Load val data
-    root_dir = os.path.join(datasets_dir, "ssvtp")
+    root_dir = resolve_dataset_root(datasets_dir)
     dataset_val = TacVisDataset(
         root_dir=root_dir, split="val",
         transform_rgb=RGB_AUGMENTS, transform_tac=TAC_AUGMENTS,
@@ -305,6 +334,10 @@ def plot_reconstruction_samples(checkpoint_path, stage1_checkpoint, datasets_dir
         unnormalize(recon_tactile[i].float(), TAC_MEAN, TAC_STD)
         for i in range(n_samples)
     ])
+
+    # Undo tac_padding 90° rotation for display — apply to BOTH original and recon
+    orig_tactile = fix_tactile_orientation(orig_tactile)
+    rec_tactile = fix_tactile_orientation(rec_tactile)
 
     # Plot: 4 rows x n_samples columns
     # Row 1: Original vision
@@ -408,7 +441,7 @@ def plot_tsne(checkpoint_path, stage1_checkpoint, datasets_dir,
     model.eval()
 
     # Load data
-    root_dir = os.path.join(datasets_dir, "ssvtp")
+    root_dir = resolve_dataset_root(datasets_dir)
     dataset_val = TacVisDataset(
         root_dir=root_dir, split="val",
         transform_rgb=RGB_AUGMENTS, transform_tac=TAC_AUGMENTS,
@@ -522,7 +555,7 @@ def plot_variable_length(checkpoint_path, stage1_checkpoint, datasets_dir,
     model.eval()
 
     # Load data
-    root_dir = os.path.join(datasets_dir, "ssvtp")
+    root_dir = resolve_dataset_root(datasets_dir)
     dataset_val = TacVisDataset(
         root_dir=root_dir, split="val",
         transform_rgb=RGB_AUGMENTS, transform_tac=TAC_AUGMENTS,

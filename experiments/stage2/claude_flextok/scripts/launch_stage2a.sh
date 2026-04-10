@@ -6,6 +6,7 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
+#SBATCH --chdir=/viscam/u/taarush/tvl
 #SBATCH --output=stage2a_%j.out
 #SBATCH --error=stage2a_%j.err
 
@@ -43,7 +44,7 @@ if [ ! -d "$DATASETS_DIR/ssvtp" ]; then
 fi
 
 # ---- Setup ----
-cd "$(dirname "$0")/../../../.."
+cd /viscam/u/taarush/tvl
 mkdir -p "$OUTPUT_DIR" logs
 
 echo "========================================="

@@ -27,6 +27,7 @@ Usage:
 
 import argparse
 import json
+import gc
 import os
 import sys
 from pathlib import Path
@@ -46,11 +47,38 @@ sys.path.insert(0, _here)
 sys.path.insert(0, os.path.join(_here, "../../.."))
 sys.path.insert(0, os.path.join(_here, "../../../tvl_enc"))
 
-from tvl_enc.tacvis import TacVisDataset, RGB_AUGMENTS, TAC_AUGMENTS
-from tvl_enc.tvl import TVL, ModalityType
-from models.cross_modal_alignment import CrossModalAlignmentModel, Stage2Wrapper
-from models.reconstruction_decoder import ReconstructionDecoder
-from models.autoregressive_decoder import AutoregressiveDecoder
+# Deferred imports to reduce peak memory.  These modules pull in open_clip,
+# timm, etc. which together add ~1-2 GB of resident memory.  We import them
+# lazily so that lightweight operations (--strip_checkpoint, arg parsing)
+# don't pay that cost, and so the checkpoint can be loaded before the
+# heaviest libraries are resident.
+TacVisDataset = None
+RGB_AUGMENTS = TAC_AUGMENTS = None
+TVL = None
+ModalityType = None
+CrossModalAlignmentModel = Stage2Wrapper = None
+ReconstructionDecoder = AutoregressiveDecoder = None
+
+
+def _ensure_imports():
+    """Import heavy dependencies on first use."""
+    global TacVisDataset, RGB_AUGMENTS, TAC_AUGMENTS
+    global TVL, ModalityType
+    global CrossModalAlignmentModel, Stage2Wrapper
+    global ReconstructionDecoder, AutoregressiveDecoder
+    if ModalityType is not None:
+        return  # already imported
+
+    from tvl_enc.tacvis import TacVisDataset as _TD, RGB_AUGMENTS as _RA, TAC_AUGMENTS as _TA
+    from tvl_enc.tvl import TVL as _TVL, ModalityType as _MT
+    from models.cross_modal_alignment import CrossModalAlignmentModel as _CMA, Stage2Wrapper as _S2W
+    from models.reconstruction_decoder import ReconstructionDecoder as _RD
+    from models.autoregressive_decoder import AutoregressiveDecoder as _AD
+
+    TacVisDataset, RGB_AUGMENTS, TAC_AUGMENTS = _TD, _RA, _TA
+    TVL, ModalityType = _TVL, _MT
+    CrossModalAlignmentModel, Stage2Wrapper = _CMA, _S2W
+    ReconstructionDecoder, AutoregressiveDecoder = _RD, _AD
 
 # Normalization constants
 RGB_MEAN = np.array([0.48145466, 0.4578275, 0.40821073])
@@ -65,6 +93,68 @@ def unnormalize(tensor, mean, std):
     return (tensor * std + mean).clamp(0, 1)
 
 
+def fix_tactile_orientation(tensor):
+    """Undo the 90-degree rotation from tac_padding() for display purposes.
+
+    tac_padding() rotates all tactile images by 90 degrees before they enter
+    the pipeline. Both the reconstruction target AND the decoder output are
+    in this rotated space. This function undoes the rotation for human
+    viewing only — apply it to BOTH target and reconstruction equally, or
+    to neither.
+    """
+    if tensor.ndim == 3:
+        return torch.rot90(tensor, k=-1, dims=[1, 2])
+    elif tensor.ndim == 4:
+        return torch.rot90(tensor, k=-1, dims=[2, 3])
+    return tensor
+
+
+def _strip_checkpoint(checkpoint_path):
+    """Create a lightweight version of the checkpoint without optimizer/scaler.
+
+    If a stripped version already exists (same path with .stripped.pth),
+    returns its path. Otherwise, loads the checkpoint on a machine with
+    enough RAM, removes optimizer/scaler, and re-saves it.
+    """
+    stripped_path = checkpoint_path.replace(".pth", ".stripped.pth")
+    if os.path.exists(stripped_path):
+        return stripped_path
+
+    print(f"Creating stripped checkpoint (removing optimizer/scaler)...")
+    print(f"This is a one-time operation. Loading: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    for key in ["optimizer", "scaler"]:
+        if key in ckpt:
+            print(f"  Removing '{key}' (freeing memory)")
+            del ckpt[key]
+    gc.collect()
+    torch.save(ckpt, stripped_path)
+    del ckpt
+    gc.collect()
+    print(f"Saved stripped checkpoint: {stripped_path}")
+    return stripped_path
+
+
+def _load_checkpoint_lightweight(checkpoint_path):
+    """Load checkpoint, preferring a stripped version if available."""
+    # Check for pre-stripped version
+    stripped_path = checkpoint_path.replace(".pth", ".stripped.pth")
+    load_path = stripped_path if os.path.exists(stripped_path) else checkpoint_path
+
+    # Use mmap=True to avoid loading all tensors into RAM at once
+    try:
+        ckpt = torch.load(load_path, map_location="cpu", mmap=True)
+    except TypeError:
+        # Older PyTorch without mmap support
+        ckpt = torch.load(load_path, map_location="cpu")
+    # Safety: remove heavy keys if they somehow survived
+    for key in ["optimizer", "scaler"]:
+        if key in ckpt:
+            del ckpt[key]
+    gc.collect()
+    return ckpt
+
+
 def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
                              n_shared=8, hidden_dim=512, device="cuda"):
     """Load Stage 2 model + reconstruction decoders from a checkpoint.
@@ -72,7 +162,10 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
     Model parameters are read from the saved run configuration in
     ckpt["args"] when available, falling back to the function defaults.
     """
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    _ensure_imports()
+
+    # Selectively load only the keys we need (skip optimizer/scaler to save RAM)
+    ckpt = _load_checkpoint_lightweight(checkpoint_path)
     saved_args = ckpt.get("args", {})
 
     # Read model hyperparameters from checkpoint args, fall back to defaults
@@ -85,14 +178,45 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
     base_channels = saved_args.get("recon_base_channels", 64)
     n_decoder_layers = saved_args.get("recon_decoder_layers", 2)
 
+    # Extract only what we need from the checkpoint and free it
+    alignment_state = ckpt.get("alignment_model", {})
+    decoder_states = {}
+    for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+        key = f"recon_decoder_{mod_name}"
+        if key not in ckpt:
+            raise KeyError(
+                f"Checkpoint missing '{key}'. This visualization requires a "
+                "reconstruction checkpoint (from Stage 2b or joint training)."
+            )
+        decoder_states[mod_name] = ckpt[key]
+    del ckpt
+    gc.collect()
+
     frozen_encoder = TVL(
         tactile_model=tactile_model,
         active_modalities=[ModalityType.VISION, ModalityType.TACTILE],
     )
-    if stage1_checkpoint and os.path.exists(stage1_checkpoint):
-        s1_ckpt = torch.load(stage1_checkpoint, map_location="cpu")
-        state = s1_ckpt.get("model", s1_ckpt)
-        frozen_encoder.load_state_dict(state, strict=False)
+    if not stage1_checkpoint or not os.path.exists(stage1_checkpoint):
+        raise ValueError(
+            f"A valid --stage1_checkpoint is required for visualization. "
+            f"Got: {stage1_checkpoint!r}"
+        )
+    s1_ckpt = torch.load(stage1_checkpoint, map_location="cpu")
+    state = s1_ckpt.get("model", s1_ckpt)
+    encoder_keys = set(frozen_encoder.state_dict().keys())
+    loaded_keys = set(state.keys())
+    if not encoder_keys.intersection(loaded_keys):
+        raise ValueError(
+            f"Stage 1 checkpoint does not contain expected encoder keys. "
+            f"Found keys: {list(loaded_keys)[:5]}"
+        )
+    frozen_encoder.load_state_dict(state, strict=False)
+    del s1_ckpt, state
+    gc.collect()
+
+    # Convert frozen encoder to float16 to save ~750MB RAM
+    frozen_encoder.half()
+    gc.collect()
 
     # Determine input dims from frozen encoder
     vision_dim = frozen_encoder.clip.visual.output_dim if hasattr(frozen_encoder.clip.visual, "output_dim") else 768
@@ -108,20 +232,17 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
     )
     model = Stage2Wrapper(frozen_encoder, alignment_model)
 
-    model.alignment_model.load_state_dict(ckpt.get("alignment_model", {}), strict=False)
-    model.to(device).eval()
+    model.alignment_model.load_state_dict(alignment_state, strict=False)
+    del alignment_state
+    gc.collect()
+    # Use float16 for entire model to minimize memory
+    model.half().to(device).eval()
 
     recon_decoders = {}
     for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-        key = f"recon_decoder_{mod_name}"
-        if key not in ckpt:
-            raise KeyError(
-                f"Checkpoint missing '{key}'. This visualization requires a "
-                "reconstruction checkpoint (from Stage 2b or joint training)."
-            )
+        state = decoder_states[mod_name]
         # Detect decoder type from saved state: autoregressive decoders have
         # cross-attention keys while convolutional decoders don't.
-        state = ckpt[key]
         is_autoregressive = any("cross_attn" in k or "spatial_queries" in k for k in state)
         if is_autoregressive:
             dec = AutoregressiveDecoder(
@@ -136,8 +257,10 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
                 n_heads=n_heads,
             )
         dec.load_state_dict(state)
-        dec.to(device).eval()
+        dec.half().to(device).eval()
         recon_decoders[mod_name] = dec
+    del decoder_states
+    gc.collect()
 
     return model, recon_decoders
 
@@ -167,13 +290,13 @@ def plot_prefix_reconstruction(model, recon_decoders, dataloader, n_registers,
     for k, v in batch.items():
         if isinstance(v, list):
             v = v[0]
-        batch[k] = v.to(device, non_blocking=True)
+        batch[k] = v.to(device=device, dtype=torch.float16, non_blocking=True)
         if batch[k].dim() > 4:
             batch[k] = batch[k].squeeze(1)
 
     prefix_lengths = get_prefix_lengths(n_registers)
 
-    with torch.no_grad(), torch.cuda.amp.autocast():
+    with torch.no_grad(), torch.amp.autocast(device_type=device.split(":")[0], dtype=torch.float16):
         frozen_features = model.frozen_encoder(batch)
         frozen_features.pop("logit_scale", None)
         frozen_features.pop("logit_bias", None)
@@ -187,14 +310,25 @@ def plot_prefix_reconstruction(model, recon_decoders, dataloader, n_registers,
         decoder = recon_decoders[mod_name]
         originals = batch[mod_name]
 
+        # Ensure tokens match decoder dtype (decoder is fp16, tokens may be fp32)
+        all_tokens = all_tokens.to(dtype=next(decoder.parameters()).dtype)
+
         # Clamp n_samples to actual batch size
         n_rows = min(n_samples, originals.shape[0])
+
+        # Undo tac_padding 90° rotation for display (apply to both original and recon)
+        if mod_name == ModalityType.TACTILE:
+            originals = fix_tactile_orientation(originals)
 
         # Precompute all prefix reconstructions once (avoid redundant batch decoding)
         prefix_recons = {}
         for k in prefix_lengths:
-            with torch.no_grad(), torch.cuda.amp.autocast():
-                prefix_recons[k] = decoder.forward_prefix(all_tokens, k=k)
+            with torch.no_grad():
+                recon = decoder.forward_prefix(all_tokens, k=k)
+                # Apply same orientation fix to reconstruction as to original
+                if mod_name == ModalityType.TACTILE:
+                    recon = fix_tactile_orientation(recon)
+                prefix_recons[k] = recon
 
         n_cols = 1 + len(prefix_lengths)  # original + each prefix
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.5 * n_cols, 2.5 * n_rows))
@@ -246,11 +380,11 @@ def plot_prefix_mse_curve(model, recon_decoders, dataloader, n_registers,
         for k, v in batch.items():
             if isinstance(v, list):
                 v = v[0]
-            batch[k] = v.to(device, non_blocking=True)
+            batch[k] = v.to(device=device, dtype=torch.float16, non_blocking=True)
             if batch[k].dim() > 4:
                 batch[k] = batch[k].squeeze(1)
 
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad(), torch.amp.autocast(device_type=device.split(":")[0], dtype=torch.float16):
             frozen_features = model.frozen_encoder(batch)
             frozen_features.pop("logit_scale", None)
             frozen_features.pop("logit_bias", None)
@@ -260,10 +394,12 @@ def plot_prefix_mse_curve(model, recon_decoders, dataloader, n_registers,
             all_tokens = output[f"{mod_name}_all_tokens"]
             decoder = recon_decoders[mod_name]
             target = batch[mod_name]
+            all_tokens = all_tokens.to(dtype=next(decoder.parameters()).dtype)
 
             for k in prefix_lengths:
-                with torch.no_grad(), torch.cuda.amp.autocast():
+                with torch.no_grad():
                     recon = decoder.forward_prefix(all_tokens, k=k)
+                # MSE is rotation-invariant, no need to fix orientation here
                 mse = torch.nn.functional.mse_loss(recon.float(), target.float()).item()
                 mse_per_k[mod_name][k].append(mse)
 
@@ -316,20 +452,47 @@ def main():
     parser.add_argument("--n_shared", type=int, default=8,
                         help="n_shared for single checkpoint mode")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--strip_checkpoint", action="store_true",
+                        help="Only strip optimizer/scaler from checkpoint and exit. "
+                             "Run this on a machine with enough RAM first.")
 
     args = parser.parse_args()
+
+    # Print memory info for debugging OOM issues
+    try:
+        import resource
+        import subprocess
+        mem_info = subprocess.check_output(["free", "-h"], text=True)
+        print(f"System memory:\n{mem_info}")
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        print(f"Current process RSS: {rss_kb / 1024:.0f} MB (before model loading)")
+    except Exception:
+        pass
+
+    # Strip mode: create lightweight checkpoint and exit
+    if args.strip_checkpoint:
+        if not args.checkpoint:
+            parser.error("--strip_checkpoint requires --checkpoint")
+        _strip_checkpoint(args.checkpoint)
+        sys.exit(0)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    _ensure_imports()
 
     # Load validation data
-    root_dir = os.path.join(args.datasets_dir, "ssvtp")
+    # If datasets_dir already contains images_rgb/ or train.csv, use it directly;
+    # otherwise try the ssvtp/ subdirectory (backwards compat with train.py).
+    root_dir = args.datasets_dir
+    if not (os.path.exists(os.path.join(root_dir, "images_rgb")) or
+            os.path.exists(os.path.join(root_dir, "train.csv"))):
+        root_dir = os.path.join(root_dir, "ssvtp")
     dataset_val = TacVisDataset(
         root_dir=root_dir, split="val",
         transform_rgb=RGB_AUGMENTS, transform_tac=TAC_AUGMENTS,
         modality_types=[ModalityType.VISION, ModalityType.TACTILE],
         text_prompt="This image gives tactile feelings of ",
     )
-    loader = DataLoader(dataset_val, batch_size=max(args.n_samples, 16),
-                        shuffle=False, num_workers=2)
+    loader = DataLoader(dataset_val, batch_size=args.n_samples,
+                        shuffle=False, num_workers=0)
 
     if args.checkpoint:
         # Single checkpoint mode

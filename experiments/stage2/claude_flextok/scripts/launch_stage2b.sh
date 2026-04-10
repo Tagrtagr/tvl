@@ -1,10 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=stage2b-recon
 #SBATCH --partition=viscam
+#SBATCH --account=viscam
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
+#SBATCH --chdir=/viscam/u/taarush/tvl
 #SBATCH --output=stage2b_%j.out
 #SBATCH --error=stage2b_%j.err
 
@@ -27,7 +29,7 @@ OUTPUT_DIR="experiments/stage2/runs/stage2b_recon"
 LOG_NAME="stage2b_recon"
 
 # ---- Setup ----
-cd "$(dirname "$0")/../../../.."
+cd /viscam/u/taarush/tvl
 mkdir -p "$OUTPUT_DIR" logs
 
 # ---- Verify paths (after cd so relative paths resolve) ----
@@ -65,7 +67,8 @@ python experiments/stage2/claude_flextok/train.py \
     --use_prefix_recon \
     --prefix_recon_weight 0.5 \
     --epochs 100 \
-    --batch_size 256 \
+    --batch_size 32 \
+    --accum_iter 8 \
     --blr 3e-4 \
     --warmup_epochs 10 \
     --num_workers 10 \
