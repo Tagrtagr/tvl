@@ -77,6 +77,7 @@ from tvl_enc.tvl import TVL, ModalityType
 from tvl_enc.tacvis import (
     TacVisDataset, TacVisDatasetV2,
     RGB_AUGMENTS, TAC_AUGMENTS, TAC_AUGMENTS_BG, TAC_AUGMENTS_BG_CJ,
+    RGB_PREPROCESS, TAC_PREPROCESS,
 )
 
 from models.cross_modal_alignment import CrossModalAlignmentModel, Stage2Wrapper
@@ -192,6 +193,11 @@ def get_args_parser():
     parser.add_argument("--dist_url", default="env://")
     parser.add_argument("--dist_eval", action="store_true", default=False)
 
+    # Debug
+    parser.add_argument("--overfit_one_sample", action="store_true", default=False,
+                        help="Overfit to a single training sample (sanity check). "
+                             "Forces batch_size=1, disables distributed, runs for many epochs.")
+
     return parser
 
 
@@ -216,7 +222,7 @@ def build_datasets(args):
         ))
         dataset_val.append(TacVisDataset(
             root_dir=root_dir, split="val",
-            transform_rgb=RGB_AUGMENTS, transform_tac=tac_augments,
+            transform_rgb=RGB_PREPROCESS, transform_tac=TAC_PREPROCESS,
             modality_types=modality_types, text_prompt=prompt,
         ))
 
@@ -238,7 +244,7 @@ def build_datasets(args):
             ))
             dataset_val.append(TacVisDatasetV2(
                 root_dir=dataset_dirs, split="val",
-                transform_rgb=RGB_AUGMENTS, transform_tac=tac_augments,
+                transform_rgb=RGB_PREPROCESS, transform_tac=TAC_PREPROCESS,
                 modality_types=modality_types, text_prompt=prompt,
             ))
 
@@ -355,7 +361,11 @@ def train_one_epoch(
         for k, v in samples.items():
             if isinstance(v, list):
                 v = v[0]
-            samples[k] = v.to(device, non_blocking=True).squeeze()
+            v = v.to(device, non_blocking=True)
+            # squeeze only extra leading dims (e.g. shape [1,B,C,H,W]), not the batch dim
+            if v.dim() > 4:
+                v = v.squeeze(0)
+            samples[k] = v
 
         stage = getattr(args, "stage", "joint")
 
@@ -493,7 +503,10 @@ def evaluate(
         for k, v in batch.items():
             if isinstance(v, list):
                 v = v[0]
-            batch[k] = v.to(device, non_blocking=True).squeeze()
+            v = v.to(device, non_blocking=True)
+            if v.dim() > 4:
+                v = v.squeeze(0)
+            batch[k] = v
             batch_size = v.shape[0]
 
         with torch.cuda.amp.autocast():
@@ -588,8 +601,23 @@ def main(args):
     # Build datasets
     dataset_train, dataset_val = build_datasets(args)
 
+    # Overfit-to-one-sample debug mode
+    if args.overfit_one_sample:
+        print("=" * 60)
+        print("OVERFIT MODE: using a single training sample")
+        print("=" * 60)
+        dataset_train = torch.utils.data.Subset(dataset_train, [0])
+        dataset_val = torch.utils.data.Subset(dataset_val, [0])
+        args.batch_size = 1
+        args.num_workers = 0
+        # Disable distributed so we don't need multi-process setup
+        args.distributed = False
+        args.world_size = 1
+        if args.epochs == 100:  # default — bump up for overfitting
+            args.epochs = 2000
+
     # Samplers
-    if True:  # distributed
+    if args.distributed:
         num_tasks = misc.get_world_size()
         global_rank = misc.get_rank()
         sampler_train = torch.utils.data.DistributedSampler(
@@ -601,11 +629,14 @@ def main(args):
             )
         else:
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+    else:
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        pin_memory=args.pin_mem, drop_last=True,
+        pin_memory=args.pin_mem, drop_last=False,
     )
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler_val,
