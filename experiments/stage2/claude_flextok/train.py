@@ -78,6 +78,7 @@ from tvl_enc.tacvis import (
     TacVisDataset, TacVisDatasetV2,
     RGB_AUGMENTS, TAC_AUGMENTS, TAC_AUGMENTS_BG, TAC_AUGMENTS_BG_CJ,
     RGB_PREPROCESS, TAC_PREPROCESS,
+    RGB_MEAN, RGB_STD, TAC_MEAN, TAC_STD,
 )
 
 from models.cross_modal_alignment import CrossModalAlignmentModel, Stage2Wrapper
@@ -197,11 +198,6 @@ def get_args_parser():
     parser.add_argument("--dist_on_itp", action="store_true")
     parser.add_argument("--dist_url", default="env://")
     parser.add_argument("--dist_eval", action="store_true", default=False)
-
-    # Debug
-    parser.add_argument("--overfit_one_sample", action="store_true", default=False,
-                        help="Overfit to a single training sample (sanity check). "
-                             "Forces batch_size=1, disables distributed, runs for many epochs.")
 
     return parser
 
@@ -421,7 +417,7 @@ def _validate_loaded_weights(module, name):
         print(f"    {param_name}: mean={pmean:.6f} std={pstd:.6f} range=[{pmin:.4f}, {pmax:.4f}]")
         checked += 1
     if checked == 0:
-        print(f"    (no parameters found)")
+        print("    (no parameters found)")
 
 
 def build_model(args, device):
@@ -1006,7 +1002,8 @@ def main(args):
         args.start_epoch = ckpt.get("epoch", 0) + 1
 
     # Run preprocessing sanity check before training starts
-    _sanity_check_preprocessing(dataset_train)
+    if not _sanity_check_preprocessing(dataset_train):
+        raise RuntimeError("Preprocessing sanity check failed — fix data pipeline before training.")
 
     # Training loop
     print(f"Start training for {args.epochs} epochs")
