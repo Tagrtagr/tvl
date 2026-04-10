@@ -1,0 +1,27 @@
+# Hydra config for image/tactile VAE pretraining
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+datasets_dir: ./.datasets
+datasets: [ssvtp, hct]
+subtract_background: null  # null | mean | median | background
+
+vae_modality: vision  # vision | tactile
+
+batch_size: 64
+epochs: 100
+lr: 2e-4
+weight_decay: 1e-4
+kl_weight: 1e-5
+latent_channels: 4
+vae_scaling_factor: 0.18215
+vae_hf_hub_path: null
+
+num_workers: 8
+seed: 42
+device: cuda
+output_dir: ./output/image_vae
+save_every: 5

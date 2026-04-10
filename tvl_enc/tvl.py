@@ -1,6 +1,7 @@
 import numpy as np
 import torch 
 import torch.nn as nn
+import torch.nn.functional as F
 import timm 
 import open_clip
 from typing import Any, Dict, Optional
@@ -101,7 +102,65 @@ class TVL(nn.Module):
         del state_dict
         return new_state_dict
 
-    def forward(self, input_dict : dict):
+    def _encode_image_tokens(self, image: torch.Tensor, drop_cls_token: bool = True, normalize: bool = True) -> torch.Tensor:
+        """
+        Return CLIP vision token sequence after transformer blocks (no pooling).
+        We still apply the pretrained projection matrix token-wise to keep the
+        token embedding dim aligned with the CLIP output space.
+        """
+        visual = self.clip.visual
+        x = visual.conv1(image)  # (B, C, Gh, Gw)
+        x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)  # (B, N, C)
+
+        x = torch.cat([
+            visual.class_embedding.to(x.dtype).expand(x.shape[0], 1, -1),
+            x,
+        ], dim=1)
+        x = x + visual.positional_embedding.to(x.dtype)
+        x = visual.patch_dropout(x)
+        x = visual.ln_pre(x)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = visual.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = visual.ln_post(x)
+
+        # CLS token is optimized for the original global objective.
+        # For register-token aggregation, patch-level tokens are preferred.
+        if drop_cls_token:
+            x = x[:, 1:, :]
+
+        if visual.proj is not None:
+            x = x @ visual.proj
+
+        if normalize:
+            x = F.normalize(x, dim=-1)
+        return x
+
+    def _encode_tactile_tokens(self, tactile: torch.Tensor, drop_cls_token: bool = True, normalize: bool = True) -> torch.Tensor:
+        """
+        Return tactile ViT token sequence after transformer blocks (no pooling).
+        Keep the learned head projection, but apply it token-wise.
+        """
+        x = self.tactile_encoder.forward_features(tactile)  # (B, N(+1), D_backbone)
+
+        if drop_cls_token:
+            num_prefix = getattr(self.tactile_encoder, "num_prefix_tokens", 1)
+            x = x[:, num_prefix:, :]
+
+        # Preserve pretrained post-transformer mappings while avoiding pooling.
+        if hasattr(self.tactile_encoder, "fc_norm"):
+            x = self.tactile_encoder.fc_norm(x)
+        if hasattr(self.tactile_encoder, "head_drop"):
+            x = self.tactile_encoder.head_drop(x)
+        if hasattr(self.tactile_encoder, "head") and isinstance(self.tactile_encoder.head, nn.Linear):
+            x = self.tactile_encoder.head(x)
+
+        if normalize:
+            x = F.normalize(x, dim=-1)
+        return x
+
+    def forward(self, input_dict : dict, return_token_sequences: bool = False, drop_cls_token: bool = True):
         # dictionary should have keys: vision, tactile, text
         # vision: (batch, 3, 224, 224)
         # tactile: (batch, 3, 224, 224)
@@ -109,12 +168,26 @@ class TVL(nn.Module):
         out_dict = {}
         if ModalityType.VISION in input_dict.keys():
             with torch.no_grad():
-                vision_features = self.clip.encode_image(input_dict[ModalityType.VISION], normalize=True)
+                if return_token_sequences:
+                    vision_features = self._encode_image_tokens(
+                        input_dict[ModalityType.VISION],
+                        drop_cls_token=drop_cls_token,
+                        normalize=True,
+                    )
+                else:
+                    vision_features = self.clip.encode_image(input_dict[ModalityType.VISION], normalize=True)
             out_dict[ModalityType.VISION] = vision_features
         if ModalityType.TACTILE in input_dict.keys():
-            tactile_features = self.tactile_encoder(input_dict[ModalityType.TACTILE])
-            # normalize tactile_features 
-            tactile_features = tactile_features / torch.norm(tactile_features, dim=1, keepdim=True)
+            if return_token_sequences:
+                tactile_features = self._encode_tactile_tokens(
+                    input_dict[ModalityType.TACTILE],
+                    drop_cls_token=drop_cls_token,
+                    normalize=True,
+                )
+            else:
+                tactile_features = self.tactile_encoder(input_dict[ModalityType.TACTILE])
+                # normalize tactile_features
+                tactile_features = tactile_features / torch.norm(tactile_features, dim=1, keepdim=True)
             out_dict[ModalityType.TACTILE] = tactile_features
         if ModalityType.TEXT in input_dict.keys():
             with torch.no_grad():

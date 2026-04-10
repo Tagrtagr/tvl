@@ -1,22 +1,21 @@
-# Sweep: 64 register tokens (16 shared + 48 private)
-model:
-  hidden_dim: 512
-  n_registers: 64
-  n_shared: 16
-  n_layers: 4
-  n_heads: 8
-  model_dropout: 0.1
-  nested_dropout: true
-  nested_dropout_mode: "power_of_two"
+# Merged legacy config from configs/sweep_reg64.yaml into Hydra conf/
 
-loss:
-  loss_type: "contrastive"
-  contrastive_weight: 1.0
-  preservation_weight: 0.5
+hidden_dim: 768
+n_registers: 64
+n_shared: 16
+n_layers: 4
+n_heads: 8
+model_dropout: 0.1
+nested_dropout: true
+nested_dropout_mode: power_of_two
 
-training:
-  epochs: 100
-  batch_size: 256
-  base_lr: 3.0e-4
-  warmup_epochs: 10
-  seed: 42
+loss_type: contrastive
+contrastive_weight: 1.0
+preservation_weight: 0.5
+
+epochs: 100
+batch_size: 256
+blr: 3.0e-4
+warmup_epochs: 10
+seed: 42
+x

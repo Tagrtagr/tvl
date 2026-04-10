@@ -27,7 +27,7 @@ set -e
 
 # ---- Paths (edit these for your setup) ----
 STAGE1_CKPT="${STAGE1_CKPT:-/viscam/u/taarush/tvl_enc_vittiny.pth}"
-DATASETS_DIR="${DATASETS_DIR:-/viscam/u/taarush/ssvtp}"
+DATASETS_DIR="${DATASETS_DIR:-/viscam/u/taarush}"
 OUTPUT_DIR="experiments/stage2/runs/stage2a_alignment"
 LOG_NAME="stage2a_alignment"
 

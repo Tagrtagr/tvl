@@ -23,3 +23,5 @@ huggingface_hub
 transformers
 open3d
 openai==0.28
+hydra-core
+omegaconf

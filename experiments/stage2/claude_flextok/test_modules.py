@@ -21,7 +21,7 @@ from losses.reconstruction_loss import ReconstructionLoss, PrefixReconstructionL
 def test_register_tokens():
     print("Testing RegisterTokenModule...")
     module = RegisterTokenModule(
-        input_dim=768, hidden_dim=512, n_registers=16,
+        input_dim=768, n_registers=16,
         n_shared=4, n_layers=2, n_heads=8,
         nested_dropout=True, nested_dropout_mode="power_of_two",
     )
@@ -33,8 +33,8 @@ def test_register_tokens():
     module.train()
     shared, private, k_keep = module(x)
     print(f"  [train] shared: {shared.shape}, private: {private.shape}, k_keep: {k_keep}")
-    assert shared.shape == (4, 4, 512), f"Expected (4, 4, 512), got {shared.shape}"
-    assert private.shape == (4, 12, 512), f"Expected (4, 12, 512), got {private.shape}"
+    assert shared.shape == (4, 4, 768), f"Expected (4, 4, 768), got {shared.shape}"
+    assert private.shape == (4, 12, 768), f"Expected (4, 12, 768), got {private.shape}"
 
     # Eval mode (no dropout)
     module.eval()
@@ -51,7 +51,7 @@ def test_cross_modal_alignment():
             "vision": {"input_dim": 768, "feature_type": "pooled"},
             "tactile": {"input_dim": 768, "feature_type": "pooled"},
         },
-        hidden_dim=256, n_registers=16, n_shared=4,
+        n_registers=16, n_shared=4,
         n_layers=2, n_heads=4,
     )
 
@@ -188,7 +188,7 @@ def test_reconstruction_backward():
             "vision": {"input_dim": 768, "feature_type": "pooled"},
             "tactile": {"input_dim": 768, "feature_type": "pooled"},
         },
-        hidden_dim=256, n_registers=16, n_shared=4,
+        n_registers=16, n_shared=4,
         n_layers=2, n_heads=4,
     )
     decoder_vision = ReconstructionDecoder(
@@ -235,7 +235,7 @@ def test_backward():
             "vision": {"input_dim": 768, "feature_type": "pooled"},
             "tactile": {"input_dim": 768, "feature_type": "pooled"},
         },
-        hidden_dim=256, n_registers=16, n_shared=4,
+        n_registers=16, n_shared=4,
         n_layers=2, n_heads=4,
     )
     loss_fn = CrossModalAlignmentLoss(modality_names=["vision", "tactile"])
@@ -266,27 +266,27 @@ def test_backward():
 def test_token_type_embeddings():
     print("Testing RegisterTokenModule with OAT-style token type embeddings...")
     module = RegisterTokenModule(
-        input_dim=768, hidden_dim=512, n_registers=16,
+        input_dim=768, n_registers=16,
         n_shared=4, n_layers=2, n_heads=8,
         use_token_type_embed=True,
     )
     assert hasattr(module, "token_type_embed"), "Missing token_type_embed parameter"
-    assert module.token_type_embed.shape == (1, 16, 512)
+    assert module.token_type_embed.shape == (1, 16, 768)
 
     x = torch.randn(4, 1, 768)
     module.train()
     shared, private, _k_keep = module(x)
-    assert shared.shape == (4, 4, 512)
-    assert private.shape == (4, 12, 512)
+    assert shared.shape == (4, 4, 768)
+    assert private.shape == (4, 12, 768)
 
     # Test without token type embeddings
     module_no_tte = RegisterTokenModule(
-        input_dim=768, hidden_dim=512, n_registers=16,
+        input_dim=768, n_registers=16,
         n_shared=4, n_layers=2, n_heads=8,
         use_token_type_embed=False,
     )
     shared2, _private2, _ = module_no_tte(x)
-    assert shared2.shape == (4, 4, 512)
+    assert shared2.shape == (4, 4, 768)
     print("  PASSED")
 
 
@@ -372,7 +372,7 @@ def test_autoregressive_decoder_backward():
             "vision": {"input_dim": 768, "feature_type": "pooled"},
             "tactile": {"input_dim": 768, "feature_type": "pooled"},
         },
-        hidden_dim=256, n_registers=16, n_shared=4,
+        n_registers=16, n_shared=4,
         n_layers=2, n_heads=4,
     )
     decoder = AutoregressiveDecoder(

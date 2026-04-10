@@ -49,19 +49,24 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
+
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-from torch.utils.data import ConcatDataset
+from torch.utils.data import ConcatDataset, Dataset
+from torchvision.utils import save_image
 try:
     from torch.utils.tensorboard import SummaryWriter
     HAS_TENSORBOARD = True
 except ImportError:
     HAS_TENSORBOARD = False
 
-import yaml
 
 # Add parent directories to path for imports
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -78,15 +83,18 @@ from tvl_enc.tacvis import (
     TacVisDataset, TacVisDatasetV2,
     RGB_AUGMENTS, TAC_AUGMENTS, TAC_AUGMENTS_BG, TAC_AUGMENTS_BG_CJ,
     RGB_PREPROCESS, TAC_PREPROCESS,
-    RGB_MEAN, RGB_STD, TAC_MEAN, TAC_STD,
+    RGB_MEAN, RGB_STD, TAC_MEAN, TAC_STD, TAC_MEAN_BG, TAC_STD_BG,
 )
 
 from models.cross_modal_alignment import CrossModalAlignmentModel, Stage2Wrapper
 from models.reconstruction_decoder import ReconstructionDecoder
 from models.autoregressive_decoder import AutoregressiveDecoder
+from models.flow_matching_decoder import FlowMatchingReconstructionDecoder
+from models.simple_vae import VAEFeatureBackbone
 from losses.alignment_loss import CrossModalAlignmentLoss
 from losses.flow_matching import FlowMatchingAlignmentLoss
-from losses.reconstruction_loss import ReconstructionLoss, PrefixReconstructionLoss
+from losses.reconstruction_loss import ReconstructionLoss
+from losses.flow_reconstruction_loss import FlowReconstructionLoss
 
 try:
     import wandb
@@ -113,18 +121,27 @@ def get_args_parser():
     # Loss
     parser.add_argument("--loss_type", type=str, default="contrastive",
                         choices=["contrastive", "flow_matching", "combined"])
+    parser.add_argument("--use_flow_matching_alignment_loss", action="store_true", default=False, help="Enable flow-matching alignment loss (optional)")
     parser.add_argument("--contrastive_weight", type=float, default=1.0)
     parser.add_argument("--preservation_weight", type=float, default=0.5)
     parser.add_argument("--flow_weight", type=float, default=0.5)
 
     # Reconstruction
-    parser.add_argument("--use_reconstruction", action="store_true", default=False,
-                        help="Enable reconstruction decoder (FlexTok-style)")
     parser.add_argument("--reconstruction_weight", type=float, default=1.0)
     parser.add_argument("--recon_base_channels", type=int, default=64)
     parser.add_argument("--recon_decoder_layers", type=int, default=2)
     parser.add_argument("--recon_loss_type", type=str, default="mse",
                         choices=["mse", "l1", "smooth_l1"])
+    parser.add_argument("--save_recon_images", action="store_true", default=True,
+                        help="Save reconstructed images during evaluation")
+    parser.add_argument("--recon_save_every", type=int, default=1,
+                        help="Save reconstructions every N eval epochs")
+    parser.add_argument("--recon_save_max_batches", type=int, default=1,
+                        help="Max number of validation batches to save per eval")
+    parser.add_argument("--flow_recon_steps", type=int, default=20,
+                        help="Euler steps for flow-matching reconstruction sampling")
+    parser.add_argument("--flow_recon_pixel_mse_weight", type=float, default=1.0,
+                        help="Image-space MSE weight for flow reconstruction loss")
 
     # OAT-style prefix reconstruction (coarse-to-fine ordering)
     parser.add_argument("--use_prefix_recon", action="store_true", default=False,
@@ -146,11 +163,12 @@ def get_args_parser():
     parser.add_argument("--alignment_checkpoint", type=str, default=None,
                         help="Path to alignment stage checkpoint (for --stage reconstruction)")
     parser.add_argument("--decoder_type", type=str, default="autoregressive",
-                        choices=["conv", "autoregressive"],
-                        help="Reconstruction decoder: 'autoregressive' (transformer) or 'conv' (ConvTranspose)")
+                        choices=["conv", "autoregressive", "flow_matching"],
+                        help="Reconstruction decoder: 'autoregressive' (transformer) or 'conv' (ConvTranspose) "
+                             "or 'flow_matching' (rectified-flow conditioned on register tokens)")
 
     # Training
-    parser.add_argument("--batch_size", default=256, type=int)
+    parser.add_argument("--batch_size", default=64, type=int)
     parser.add_argument("--epochs", default=100, type=int)
     parser.add_argument("--accum_iter", default=1, type=int)
     parser.add_argument("--lr", type=float, default=None)
@@ -165,6 +183,17 @@ def get_args_parser():
                         help="Path to Stage 1 TVL encoder checkpoint")
     parser.add_argument("--tactile_model", type=str, default="vit_tiny_patch16_224",
                         choices=["vit_base_patch16_224", "vit_small_patch16_224", "vit_tiny_patch16_224"])
+
+    # Frozen feature extractor choice for Stage 2
+    parser.add_argument("--feature_backbone", type=str, default="encoders",
+                        choices=["encoders", "vae"],
+                        help="Use pretrained stage-1 encoders (default) or pretrained VAE encoder tokens")
+    parser.add_argument("--vae_checkpoint", type=str, default=None,
+                        help="Path to pretrained VAE checkpoint (supports regular .pth and .safetensors when available)")
+    parser.add_argument("--vae_latent_channels", type=int, default=4,
+                        help="Latent channel count used by the pretrained VAE")
+    parser.add_argument("--vae_scaling_factor", type=float, default=0.18215,
+                        help="Latent scaling factor used by FlexTok/diffusers-style VAE")
 
     # Data
     parser.add_argument("--datasets_dir", type=str, default="./.datasets")
@@ -200,6 +229,107 @@ def get_args_parser():
     parser.add_argument("--dist_eval", action="store_true", default=False)
 
     return parser
+
+
+def _sample_group_key_from_path(path: str) -> str:
+    """Best-effort sample-group key extracted from sample path.
+
+    For TacVis-style layouts, this is usually the parent sequence/folder.
+    """
+    norm = os.path.normpath(path)
+    parts = norm.split(os.sep)
+
+    # Common pattern: .../<traj_dir>/images_rgb/<image_file>
+    if len(parts) >= 2 and parts[-2] in {"images_rgb", "images_tac", "images_tactile", "rgb", "tac"}:
+        return parts[-3] if len(parts) >= 3 else os.path.dirname(norm)
+
+    # Generic: use immediate parent directory as sample-group key
+    return os.path.basename(os.path.dirname(norm)) or os.path.dirname(norm)
+
+
+def _filter_dataset_single_sample(dataset, selector: Optional[str] = None, max_samples: Optional[int] = 1):
+    """In-place filter for TacVisDataset/TacVisDatasetV2 to a tiny sample subset.
+
+    Behavior is sample-level (paired image+tactile), not sequence-level:
+    - selector=None: keep from first sample onward
+    - selector=str : keep from first sample whose key/path contains selector
+    - max_samples: number of paired samples to keep (default 1)
+
+    Returns: (selected_sample, n_before, n_after)
+    """
+    if not hasattr(dataset, "paths"):
+        raise TypeError("Dataset does not expose .paths; cannot apply debug single-sample filter")
+
+    keep_n = 1 if max_samples is None else max(0, int(max_samples))
+    paths = dataset.paths
+
+    # TacVisDatasetV2 stores dict of modality lists
+    if isinstance(paths, dict):
+        vision_paths = paths.get("vision", [])
+        if not vision_paths:
+            raise ValueError("Dataset has no vision paths to infer sample")
+
+        if selector is None:
+            start_idx = 0
+        else:
+            start_idx = None
+            for i, p in enumerate(vision_paths):
+                key = _sample_group_key_from_path(p)
+                if (selector in key) or (selector in p):
+                    start_idx = i
+                    break
+            if start_idx is None:
+                raise ValueError(f"No samples matched debug_sample_selector='{selector}'")
+
+        keep_idx = list(range(start_idx, min(start_idx + keep_n, len(vision_paths))))
+        selected_sample = vision_paths[start_idx]
+        n_before = len(vision_paths)
+        dataset.paths = {k: [v[i] for i in keep_idx] for k, v in paths.items()}
+        n_after = len(dataset.paths["vision"])
+        return selected_sample, n_before, n_after
+
+    # TacVisDataset stores list of rgb paths
+    if isinstance(paths, list):
+        if not paths:
+            raise ValueError("Dataset has no paths to infer sample")
+
+        if selector is None:
+            start_idx = 0
+        else:
+            start_idx = None
+            for i, p in enumerate(paths):
+                key = _sample_group_key_from_path(p)
+                if (selector in key) or (selector in p):
+                    start_idx = i
+                    break
+            if start_idx is None:
+                raise ValueError(f"No samples matched debug_sample_selector='{selector}'")
+
+        keep_idx = list(range(start_idx, min(start_idx + keep_n, len(paths))))
+        selected_sample = paths[start_idx]
+        n_before = len(paths)
+        dataset.paths = [paths[i] for i in keep_idx]
+        n_after = len(dataset.paths)
+        return selected_sample, n_before, n_after
+
+    raise TypeError(f"Unsupported dataset.paths type: {type(paths)}")
+
+
+class DebugRepeatCachedDataset(Dataset):
+    """Repeat a tiny dataset from RAM cache to avoid per-step disk IO in debug."""
+
+    def __init__(self, dataset: Dataset, repeat_size: int = 4096):
+        self.dataset = dataset
+        self.repeat_size = max(1, int(repeat_size))
+        self.cache = [dataset[i] for i in range(len(dataset))]
+        if len(self.cache) == 0:
+            raise ValueError("DebugRepeatCachedDataset received an empty dataset")
+
+    def __len__(self):
+        return self.repeat_size
+
+    def __getitem__(self, index):
+        return self.cache[index % len(self.cache)]
 
 
 def build_datasets(args):
@@ -250,11 +380,54 @@ def build_datasets(args):
             ))
 
     if len(dataset_train) == 1:
-        return dataset_train[0], dataset_val[0]
+        train_ds, val_ds = dataset_train[0], dataset_val[0]
     elif len(dataset_train) > 1:
-        return ConcatDataset(dataset_train), ConcatDataset(dataset_val)
+        train_ds, val_ds = ConcatDataset(dataset_train), ConcatDataset(dataset_val)
     else:
         raise ValueError(f"No datasets found in {args.datasets_dir}")
+
+    # Debug mode: constrain dataset to a tiny number of paired samples.
+    # Applied before DataLoader creation for deterministic one-sample overfit tests.
+    if getattr(args, "debug_single_sample", False):
+        selector = getattr(args, "debug_sample_selector", None)
+        max_train_samples = getattr(args, "debug_max_train_samples", 1)
+        debug_dataset_mode = getattr(args, "debug_dataset_mode", "filter")
+        debug_repeat_size = getattr(args, "debug_repeat_size", 4096)
+
+        def _iter_components(ds):
+            if isinstance(ds, ConcatDataset):
+                return ds.datasets
+            return [ds]
+
+        for i, ds_comp in enumerate(_iter_components(train_ds)):
+            selected_sample, n0, n1 = _filter_dataset_single_sample(
+                ds_comp,
+                selector=selector,
+                max_samples=max_train_samples,
+            )
+            print(f"[debug_single_sample][train][{i}] sample='{selected_sample}' {n0} -> {n1} samples")
+
+        for i, ds_comp in enumerate(_iter_components(val_ds)):
+            selected_sample, n0, n1 = _filter_dataset_single_sample(
+                ds_comp,
+                selector=selector,
+                max_samples=max_train_samples,
+            )
+            print(f"[debug_single_sample][val][{i}] sample='{selected_sample}' {n0} -> {n1} samples")
+
+        if debug_dataset_mode == "repeat_cached":
+            train_before = len(train_ds)
+            val_before = len(val_ds)
+            train_ds = DebugRepeatCachedDataset(train_ds, repeat_size=debug_repeat_size)
+            val_ds = DebugRepeatCachedDataset(val_ds, repeat_size=debug_repeat_size)
+            print(
+                f"[debug_single_sample] dataset_mode=repeat_cached "
+                f"train {train_before} -> {len(train_ds)}, val {val_before} -> {len(val_ds)}"
+            )
+        else:
+            print(f"[debug_single_sample] dataset_mode={debug_dataset_mode}")
+
+    return train_ds, val_ds
 
 
 def _sanity_check_preprocessing(dataset, device="cpu"):
@@ -421,45 +594,63 @@ def _validate_loaded_weights(module, name):
 
 
 def build_model(args, device):
-    """Build frozen encoder + Stage 2 alignment model."""
-    # Validate Stage 1 checkpoint before loading
-    _validate_stage1_checkpoint(args.stage1_checkpoint, args.tactile_model)
+    """Build frozen backbone + Stage 2 alignment model."""
+    if getattr(args, "feature_backbone", "encoders") == "vae":
+        # Build frozen VAE feature backbone
+        frozen_encoder = VAEFeatureBackbone(
+            hidden_dim=768,
+            latent_channels=args.vae_latent_channels,
+            scaling_factor=args.vae_scaling_factor,
+        )
+        if not args.vae_checkpoint or not os.path.exists(args.vae_checkpoint):
+            raise FileNotFoundError(
+                "--feature_backbone vae requires a valid --vae_checkpoint"
+            )
+        print(f"Loading pretrained VAE checkpoint from {args.vae_checkpoint}")
+        missing, unexpected = frozen_encoder.load_pretrained_checkpoint(
+            args.vae_checkpoint,
+            strict=False,
+        )
+        if missing:
+            print(f"[warn] VAE missing keys: {len(missing)}")
+        if unexpected:
+            print(f"[warn] VAE unexpected keys: {len(unexpected)}")
 
-    # Build frozen Stage 1 encoder
-    frozen_encoder = TVL(
-        tactile_model=args.tactile_model,
-        active_modalities=[ModalityType.VISION, ModalityType.TACTILE],
-    )
+        modality_configs = {
+            ModalityType.VISION: {"input_dim": frozen_encoder.hidden_dim, "feature_type": "sequence"},
+            ModalityType.TACTILE: {"input_dim": frozen_encoder.hidden_dim, "feature_type": "sequence"},
+        }
+    else:
+        # Build frozen Stage 1 encoders
+        frozen_encoder = TVL(
+            tactile_model=args.tactile_model,
+            active_modalities=[ModalityType.VISION, ModalityType.TACTILE],
+        )
 
-    # Load Stage 1 checkpoint if provided
-    if args.stage1_checkpoint and os.path.exists(args.stage1_checkpoint):
-        print(f"Loading Stage 1 checkpoint from {args.stage1_checkpoint}")
-        ckpt = torch.load(args.stage1_checkpoint, map_location="cpu")
-        state = ckpt["model"] if "model" in ckpt else ckpt
-        msg = frozen_encoder.load_state_dict(state, strict=False)
-        print(f"  Loaded (missing: {len(msg.missing_keys)}, unexpected: {len(msg.unexpected_keys)})")
-        if msg.missing_keys:
-            print(f"  Missing keys (first 5): {msg.missing_keys[:5]}")
+        # Load Stage 1 checkpoint if provided
+        if args.stage1_checkpoint and os.path.exists(args.stage1_checkpoint):
+            print(f"Loading Stage 1 checkpoint from {args.stage1_checkpoint}")
+            ckpt = torch.load(args.stage1_checkpoint, map_location="cpu", weights_only=False)
+            if "model" in ckpt:
+                frozen_encoder.load_state_dict(ckpt["model"], strict=False)
+            else:
+                frozen_encoder.load_state_dict(ckpt, strict=False)
 
-        # Validate: sample weight values to confirm non-random initialization
-        _validate_loaded_weights(frozen_encoder, "frozen_encoder")
+        # Determine input dims from the frozen encoder
+        # Vision: OpenCLIP ViT-L-14 outputs 768-dim
+        # Tactile: depends on tactile_model + whether num_classes matches CLIP width
+        vision_dim = frozen_encoder.clip.visual.output_dim if hasattr(frozen_encoder.clip.visual, "output_dim") else 768
+        tactile_dim = frozen_encoder.tactile_encoder.num_classes if frozen_encoder.tactile_encoder.num_classes > 0 else frozen_encoder.tactile_encoder.num_features
 
-    # Determine input dims from the frozen encoder
-    # Vision: OpenCLIP ViT-L-14 outputs 768-dim
-    # Tactile: depends on tactile_model + whether num_classes matches CLIP width
-    vision_dim = frozen_encoder.clip.visual.output_dim if hasattr(frozen_encoder.clip.visual, "output_dim") else 768
-    tactile_dim = frozen_encoder.tactile_encoder.num_classes if frozen_encoder.tactile_encoder.num_classes > 0 else frozen_encoder.tactile_encoder.num_features
-
-    modality_configs = {
-        ModalityType.VISION: {"input_dim": vision_dim, "feature_type": "pooled"},
-        ModalityType.TACTILE: {"input_dim": tactile_dim, "feature_type": "pooled"},
-    }
+        modality_configs = {
+            ModalityType.VISION: {"input_dim": vision_dim, "feature_type": "sequence"},
+            ModalityType.TACTILE: {"input_dim": tactile_dim, "feature_type": "sequence"},
+        }
 
     # Build Stage 2 alignment model
     use_token_type = getattr(args, "use_token_type_embed", True)
     alignment_model = CrossModalAlignmentModel(
         modality_configs=modality_configs,
-        hidden_dim=args.hidden_dim,
         n_registers=args.n_registers,
         n_shared=args.n_shared,
         n_layers=args.n_layers,
@@ -477,7 +668,7 @@ def build_model(args, device):
     return model
 
 
-def build_loss(args, device):
+def build_loss(args, device, embed_dim):
     """Build loss function(s) based on configuration."""
     modality_names = [ModalityType.VISION, ModalityType.TACTILE]
 
@@ -485,13 +676,13 @@ def build_loss(args, device):
         modality_names=modality_names,
         contrastive_weight=args.contrastive_weight,
         preservation_weight=args.preservation_weight,
-    )
+    ).to(device)
 
     flow_loss = None
-    if args.loss_type in ["flow_matching", "combined"]:
+    if getattr(args, "use_flow_matching_alignment_loss", False) and args.loss_type in ["flow_matching", "combined"]:
         flow_loss = FlowMatchingAlignmentLoss(
             modality_names=modality_names,
-            embed_dim=args.hidden_dim,
+            embed_dim=embed_dim,
         ).to(device)
 
     return contrastive_loss, flow_loss
@@ -502,10 +693,77 @@ def _unwrap(model):
     return model.module if hasattr(model, "module") else model
 
 
+def _unnormalize_for_display(x: torch.Tensor, mod_name: str, args) -> torch.Tensor:
+    """Map normalized tensors back to [0,1]-like pixel space for visualization/flow targets."""
+    if mod_name == ModalityType.VISION:
+        mean = torch.tensor(RGB_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        std = torch.tensor(RGB_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    elif mod_name == ModalityType.TACTILE:
+        if getattr(args, "subtract_background", None) == "background":
+            mean_np = TAC_MEAN_BG
+            std_np = TAC_STD_BG
+        else:
+            mean_np = TAC_MEAN
+            std_np = TAC_STD
+        mean = torch.tensor(mean_np, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        std = torch.tensor(std_np, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    else:
+        return x
+    return x * std + mean
+
+
+def _save_recon_images(
+    batch_idx,
+    alignment_output,
+    batch,
+    recon_decoders,
+    output_dir,
+    epoch,
+    stage,
+    args,
+):
+    if recon_decoders is None or output_dir is None:
+        return
+    if not getattr(args, "save_recon_images", False):
+        return
+    if epoch is None:
+        return
+    if args.recon_save_every <= 0:
+        return
+    if epoch % args.recon_save_every != 0:
+        return
+    if batch_idx >= args.recon_save_max_batches:
+        return
+
+    recon_root = Path(output_dir) / "reconstructions" / stage / f"epoch_{epoch:04d}" / f"batch_{batch_idx:03d}"
+    recon_root.mkdir(parents=True, exist_ok=True)
+
+    for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+        all_tokens_key = f"{mod_name}_all_tokens"
+        if all_tokens_key not in alignment_output or mod_name not in batch:
+            continue
+        tokens = alignment_output[all_tokens_key]
+        targets = batch[mod_name]
+        decoder = recon_decoders.get(mod_name)
+        if decoder is None:
+            continue
+
+        if isinstance(_unwrap(decoder), FlowMatchingReconstructionDecoder):
+            recons = _unwrap(decoder).sample(tokens, n_steps=args.flow_recon_steps)
+        else:
+            recons = decoder(tokens)
+
+        targets = torch.clamp(_unnormalize_for_display(targets, mod_name, args), 0.0, 1.0)
+        recons = torch.clamp(_unnormalize_for_display(recons, mod_name, args), 0.0, 1.0)
+
+        save_image(targets, recon_root / f"{mod_name}_target.png", nrow=8)
+        save_image(recons, recon_root / f"{mod_name}_recon.png", nrow=8)
+
+
 def train_one_epoch(
     model, contrastive_loss_fn, flow_loss_fn, data_loader,
     optimizer, device, epoch, loss_scaler, args, log_writer=None,
-    recon_decoders=None, recon_loss_fn=None, prefix_recon_loss_fn=None,
+    recon_decoders=None, recon_loss_fn=None,
 ):
     model.train()
     # Keep frozen encoder in eval mode
@@ -528,7 +786,8 @@ def train_one_epoch(
     accum_iter = args.accum_iter
 
     optimizer.zero_grad()
-
+    
+    # import ipdb; ipdb.set_trace()
     for data_iter_step, samples in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         # Per-iteration LR schedule
         if data_iter_step % accum_iter == 0:
@@ -538,20 +797,7 @@ def train_one_epoch(
         for k, v in samples.items():
             if isinstance(v, list):
                 v = v[0]
-            v = v.to(device, non_blocking=True)
-            # squeeze only extra leading dims (e.g. shape [1,B,C,H,W]), not the batch dim
-            if v.dim() > 4:
-                v = v.squeeze(0)
-            samples[k] = v
-
-        # First-iteration shape validation
-        if data_iter_step == 0 and epoch == 0:
-            for k, v in samples.items():
-                if isinstance(v, torch.Tensor) and v.ndim >= 3:
-                    print(f"  [shape_check] {k}: {tuple(v.shape)}")
-                    # Expect (B, 3, 224, 224) or (3, 224, 224) for batch_size=1
-                    if v.shape[-3:] != (3, 224, 224) and v.shape[-2:] != (224, 224):
-                        print(f"  *** WARNING: unexpected shape for {k}: {tuple(v.shape)} ***")
+            samples[k] = v.to(device, non_blocking=True)
 
         stage = getattr(args, "stage", "joint")
 
@@ -578,6 +824,7 @@ def train_one_epoch(
                     alignment_output,
                     frozen_features=frozen_features,
                     preservation_projectors=preservation_projectors,
+                    input_images=samples,
                     output_dict=True,
                 )
                 loss = align_dict["total_loss"]
@@ -590,50 +837,40 @@ def train_one_epoch(
                     loss = loss + args.flow_weight * flow_loss
                     loss_dict["flow_loss"] = flow_loss
 
-            # Reconstruction loss (reconstruction and joint stages)
-            if stage != "alignment":
-                # Skip standalone recon when prefix recon is enabled (it already
-                # computes full reconstruction internally, avoiding double decode).
-                if recon_decoders is not None and recon_loss_fn is not None and prefix_recon_loss_fn is None:
-                    recons = {}
-                    targets = {}
-                    for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-                        all_tokens_key = f"{mod_name}_all_tokens"
-                        if all_tokens_key in alignment_output and mod_name in samples:
-                            recons[mod_name] = recon_decoders[mod_name](alignment_output[all_tokens_key])
+            # Reconstruction loss (alignment / reconstruction / joint stages)
+            if recon_decoders is not None and recon_loss_fn is not None:
+                targets = {}
+                all_tokens = {}
+                prefix_tokens = {}
+                for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+                    all_tokens_key = f"{mod_name}_all_tokens"
+                    prefix_tokens_key = f"{mod_name}_prefix_tokens"
+                    if all_tokens_key in alignment_output and mod_name in samples:
+                        all_tokens[mod_name] = alignment_output[all_tokens_key]
+                        if prefix_tokens_key in alignment_output:
+                            prefix_tokens[mod_name] = alignment_output[prefix_tokens_key]
+                        if isinstance(recon_loss_fn, FlowReconstructionLoss):
+                            targets[mod_name] = _unnormalize_for_display(samples[mod_name], mod_name, args)
+                        else:
                             targets[mod_name] = samples[mod_name]
-                    if recons:
-                        # Periodic sanity check on reconstruction outputs
-                        for mod_name in recons:
-                            _sanity_check_reconstruction(
-                                recons[mod_name], targets[mod_name],
-                                mod_name, data_iter_step,
-                            )
+                if all_tokens:
+                    if isinstance(recon_loss_fn, FlowReconstructionLoss):
+                        recon_dict = recon_loss_fn(
+                            all_tokens,
+                            targets,
+                            recon_decoders,
+                            output_dict=True,
+                            prefix_tokens=prefix_tokens,
+                        )
+                    else:
+                        recons = {m: recon_decoders[m](all_tokens[m]) for m in all_tokens}
                         recon_dict = recon_loss_fn(recons, targets)
-                        recon_loss = recon_dict["recon_total"]
-                        loss = loss + args.reconstruction_weight * recon_loss
-                        for k, v in recon_dict.items():
-                            if isinstance(v, torch.Tensor):
-                                loss_dict[k] = v
 
-                # OAT-style prefix reconstruction loss (if enabled)
-                if prefix_recon_loss_fn is not None and recon_decoders is not None:
-                    all_tokens = {}
-                    targets_pf = {}
-                    for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-                        all_tokens_key = f"{mod_name}_all_tokens"
-                        if all_tokens_key in alignment_output and mod_name in samples:
-                            all_tokens[mod_name] = alignment_output[all_tokens_key]
-                            targets_pf[mod_name] = samples[mod_name]
-                    if all_tokens:
-                        # Unwrap DDP so PrefixReconstructionLoss can call decoder.forward_prefix
-                        raw_decoders = {m: _unwrap(d) for m, d in recon_decoders.items()}
-                        prefix_dict = prefix_recon_loss_fn(all_tokens, targets_pf, raw_decoders)
-                        prefix_loss = prefix_dict["recon_total"]
-                        loss = loss + prefix_loss
-                        for k, v in prefix_dict.items():
-                            if isinstance(v, torch.Tensor):
-                                loss_dict[f"prefix_{k}"] = v
+                    recon_loss = recon_dict["recon_total"]
+                    loss = loss + args.reconstruction_weight * recon_loss
+                    for k, v in recon_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            loss_dict[k] = v
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -681,7 +918,8 @@ def train_one_epoch(
 @torch.no_grad()
 def evaluate(
     data_loader, contrastive_loss_fn, model, device, epoch=None, log_writer=None,
-    recon_decoders=None, recon_loss_fn=None, prefix_recon_loss_fn=None, args=None,
+    recon_decoders=None, recon_loss_fn=None, args=None,
+    stage="joint", output_dir=None,
 ):
     metric_logger = misc.MetricLogger(delimiter="  ")
     header = "Test:"
@@ -691,14 +929,11 @@ def evaluate(
         for dec in recon_decoders.values():
             dec.eval()
 
-    for batch in metric_logger.log_every(data_loader, 10, header):
+    for batch_idx, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
         for k, v in batch.items():
             if isinstance(v, list):
                 v = v[0]
-            v = v.to(device, non_blocking=True)
-            if v.dim() > 4:
-                v = v.squeeze(0)
-            batch[k] = v
+            batch[k] = v.to(device, non_blocking=True)
             batch_size = v.shape[0]
 
         with torch.cuda.amp.autocast():
@@ -709,43 +944,53 @@ def evaluate(
                 alignment_output,
                 frozen_features=frozen_features,
                 preservation_projectors=preservation_projectors,
+                input_images=batch,
                 output_dict=True,
             )
 
             # Reconstruction loss (if enabled)
-            # Skip standalone recon when prefix recon is active (mirrors training)
-            if recon_decoders is not None and recon_loss_fn is not None and prefix_recon_loss_fn is None:
-                recons = {}
+            if recon_decoders is not None and recon_loss_fn is not None:
                 targets = {}
+                all_tokens = {}
+                prefix_tokens = {}
                 for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
                     all_tokens_key = f"{mod_name}_all_tokens"
+                    prefix_tokens_key = f"{mod_name}_prefix_tokens"
                     if all_tokens_key in alignment_output and mod_name in batch:
-                        recons[mod_name] = recon_decoders[mod_name](alignment_output[all_tokens_key])
-                        targets[mod_name] = batch[mod_name]
-                if recons:
-                    recon_dict = recon_loss_fn(recons, targets)
+                        all_tokens[mod_name] = alignment_output[all_tokens_key]
+                        if prefix_tokens_key in alignment_output:
+                            prefix_tokens[mod_name] = alignment_output[prefix_tokens_key]
+                        if isinstance(recon_loss_fn, FlowReconstructionLoss):
+                            targets[mod_name] = _unnormalize_for_display(batch[mod_name], mod_name, args)
+                        else:
+                            targets[mod_name] = batch[mod_name]
+                if all_tokens:
+                    if isinstance(recon_loss_fn, FlowReconstructionLoss):
+                        recon_dict = recon_loss_fn(
+                            all_tokens,
+                            targets,
+                            recon_decoders,
+                            output_dict=True,
+                            prefix_tokens=prefix_tokens,
+                        )
+                    else:
+                        recons = {m: recon_decoders[m](all_tokens[m]) for m in all_tokens}
+                        recon_dict = recon_loss_fn(recons, targets)
                     for k_r, v_r in recon_dict.items():
                         if isinstance(v_r, torch.Tensor):
                             loss_dict[k_r] = v_r
 
-            # OAT-style prefix reconstruction loss (if enabled)
-            if prefix_recon_loss_fn is not None and recon_decoders is not None:
-                all_tokens = {}
-                targets_pf = {}
-                for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-                    all_tokens_key = f"{mod_name}_all_tokens"
-                    if all_tokens_key in alignment_output and mod_name in batch:
-                        all_tokens[mod_name] = alignment_output[all_tokens_key]
-                        targets_pf[mod_name] = batch[mod_name]
-                if all_tokens:
-                    # Unwrap DDP so PrefixReconstructionLoss can call decoder.forward_prefix
-                    raw_decoders = {m: _unwrap(d) for m, d in recon_decoders.items()}
-                    prefix_dict = prefix_recon_loss_fn(all_tokens, targets_pf, raw_decoders)
-                    for k_r, v_r in prefix_dict.items():
-                        if isinstance(v_r, torch.Tensor):
-                            loss_dict[f"prefix_{k_r}"] = v_r
-                    # Use prefix recon_total for model selection
-                    loss_dict["recon_total"] = prefix_dict["recon_total"]
+            _save_recon_images(
+                batch_idx,
+                alignment_output,
+                batch,
+                recon_decoders,
+                output_dir,
+                epoch,
+                stage,
+                args,
+            )
+
 
         loss = loss_dict["total_loss"]
         recon_total = loss_dict.get("recon_total")
@@ -775,7 +1020,7 @@ def evaluate(
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
-def main(args):
+def run(args):
     misc.init_distributed_mode(args)
     torch.backends.cudnn.deterministic = True
 
@@ -839,17 +1084,27 @@ def main(args):
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    overfit = getattr(args, "overfit_one_sample", False)
+    debug_mode = getattr(args, "debug_single_sample", False)
+    effective_num_workers = args.num_workers
+    if debug_mode:
+        effective_num_workers = int(getattr(args, "debug_num_workers", 0))
+
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size, num_workers=args.num_workers,
-        pin_memory=args.pin_mem, drop_last=False,
+        batch_size=args.batch_size, num_workers=effective_num_workers,
+        pin_memory=args.pin_mem, drop_last=True,
     )
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler_val,
-        batch_size=args.batch_size, num_workers=args.num_workers,
+        batch_size=args.batch_size, num_workers=effective_num_workers,
         pin_memory=args.pin_mem, drop_last=False,
     )
+
+    # Single-sample overfit mode: evaluate on exactly the same stream as training.
+    # This is intentionally strict (same dataloader object) for debugging parity.
+    if len(dataset_train) == 1 or debug_mode:
+        print("[single-sample] Reusing training dataloader for evaluation")
+        data_loader_val = data_loader_train
 
     # Build model
     model = build_model(args, device)
@@ -880,52 +1135,65 @@ def main(args):
         n_frozen = sum(p.numel() for p in model_without_ddp.alignment_model.parameters())
         model_without_ddp.alignment_model.eval()
         print(f"Froze alignment model ({n_frozen:,} params) for reconstruction stage")
-        args.use_reconstruction = True
     elif stage == "alignment":
-        args.use_reconstruction = False
-        print("Alignment stage: reconstruction disabled")
+        args.decoder_type = "flow_matching"
+        print("Alignment stage: register-token alignment + flow reconstruction")
 
     # Build reconstruction decoders (if enabled)
     recon_decoders = None
     recon_loss_fn = None
-    prefix_recon_loss_fn = None
-    if args.use_reconstruction:
-        recon_decoders = {}
-        decoder_type = getattr(args, "decoder_type", "autoregressive")
-        if decoder_type == "autoregressive":
-            for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-                recon_decoders[mod_name] = AutoregressiveDecoder(
-                    n_registers=args.n_registers,
-                    hidden_dim=args.hidden_dim,
-                    base_channels=args.recon_base_channels,
-                    n_decoder_layers=args.recon_decoder_layers,
-                    n_heads=args.n_heads,
-                ).to(device)
-        else:
-            for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-                recon_decoders[mod_name] = ReconstructionDecoder(
-                    n_registers=args.n_registers,
-                    hidden_dim=args.hidden_dim,
-                    base_channels=args.recon_base_channels,
-                    n_decoder_layers=args.recon_decoder_layers,
-                    n_heads=args.n_heads,
-                ).to(device)
-        recon_loss_fn = ReconstructionLoss(loss_type=args.recon_loss_type)
-        n_decoder_params = sum(
-            sum(p.numel() for p in dec.parameters())
-            for dec in recon_decoders.values()
+    recon_decoders = {}
+    alignment_hidden_dim = model_without_ddp.alignment_model.hidden_dim
+    decoder_type = getattr(args, "decoder_type", "autoregressive")
+    if decoder_type == "flow_matching" and args.recon_loss_type != "mse":
+        raise ValueError("--decoder_type flow_matching requires --recon_loss_type mse")
+    if decoder_type == "autoregressive":
+        for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+            recon_decoders[mod_name] = AutoregressiveDecoder(
+                n_registers=args.n_registers,
+                hidden_dim=alignment_hidden_dim,
+                base_channels=args.recon_base_channels,
+                n_decoder_layers=args.recon_decoder_layers,
+                n_heads=args.n_heads,
+            ).to(device)
+    elif decoder_type == "flow_matching":
+        for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+            recon_decoders[mod_name] = FlowMatchingReconstructionDecoder(
+                n_registers=args.n_registers,
+                hidden_dim=alignment_hidden_dim,
+                base_channels=args.recon_base_channels,
+                n_decoder_layers=args.recon_decoder_layers,
+                n_heads=args.n_heads,
+            ).to(device)
+    else:
+        for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+            recon_decoders[mod_name] = ReconstructionDecoder(
+                n_registers=args.n_registers,
+                hidden_dim=alignment_hidden_dim,
+                base_channels=args.recon_base_channels,
+                n_decoder_layers=args.recon_decoder_layers,
+                n_heads=args.n_heads,
+            ).to(device)
+    # Choose reconstruction objective based on decoder type.
+    # Pixel losses (mse/l1/smooth_l1) are used for conv/autoregressive decoders.
+    # Flow-matching decoder is trained with a rectified-flow loss in pixel space.
+    if decoder_type == "flow_matching":
+        recon_loss_fn = FlowReconstructionLoss(
+            loss_type=args.recon_loss_type,
+            pixel_mse_weight=args.flow_recon_pixel_mse_weight,
+            use_prefix_recon=getattr(args, "use_prefix_recon", False),
+            prefix_weight=getattr(args, "prefix_recon_weight", 0.5),
         )
-        print(f"Reconstruction decoders: {n_decoder_params:,} parameters ({len(recon_decoders)} modalities)")
+    else:
+        recon_loss_fn = ReconstructionLoss(loss_type=args.recon_loss_type)
+    n_decoder_params = sum(sum(p.numel() for p in dec.parameters()) for dec in recon_decoders.values())
+    print(f"Reconstruction decoders: {n_decoder_params:,} parameters ({len(recon_decoders)} modalities)")
 
-        # OAT-style prefix reconstruction loss
-        use_prefix = getattr(args, "use_prefix_recon", False)
-        if use_prefix:
-            prefix_weight = getattr(args, "prefix_recon_weight", 0.5)
-            prefix_recon_loss_fn = PrefixReconstructionLoss(
-                loss_type=args.recon_loss_type,
-                prefix_weight=prefix_weight,
-            )
-            print(f"OAT-style prefix reconstruction enabled (weight={prefix_weight})")
+    # Prefix reconstruction is computed inside FlowReconstructionLoss when enabled.
+    use_prefix = getattr(args, "use_prefix_recon", False)
+    if use_prefix and decoder_type == "flow_matching":
+        prefix_weight = getattr(args, "prefix_recon_weight", 0.5)
+        print(f"Flow prefix reconstruction enabled (weight={prefix_weight})")
 
     # Logging
     if global_rank == 0 and args.log_dir is not None and HAS_TENSORBOARD:
@@ -953,7 +1221,9 @@ def main(args):
                 )
 
     # Build loss
-    contrastive_loss_fn, flow_loss_fn = build_loss(args, device)
+    contrastive_loss_fn, flow_loss_fn = build_loss(
+        args, device, embed_dim=model_without_ddp.alignment_model.hidden_dim
+    )
 
     # Optimizer: collect trainable parameters based on stage
     trainable_params = []
@@ -961,7 +1231,7 @@ def main(args):
         trainable_params += list(model_without_ddp.alignment_model.parameters())
         if flow_loss_fn is not None:
             trainable_params += list(flow_loss_fn.parameters())
-    if stage != "alignment" and recon_decoders is not None:
+    if recon_decoders is not None:
         for dec in recon_decoders.values():
             trainable_params += list(dec.parameters())
     trainable_params = [p for p in trainable_params if p.requires_grad]
@@ -1019,13 +1289,12 @@ def main(args):
             model, contrastive_loss_fn, flow_loss_fn, data_loader_train,
             optimizer, device, epoch, loss_scaler, args, log_writer=log_writer,
             recon_decoders=recon_decoders, recon_loss_fn=recon_loss_fn,
-            prefix_recon_loss_fn=prefix_recon_loss_fn,
         )
 
         val_stats = evaluate(data_loader_val, contrastive_loss_fn, model, device,
                              epoch=epoch, log_writer=log_writer,
-                             recon_decoders=recon_decoders, recon_loss_fn=recon_loss_fn,
-                             prefix_recon_loss_fn=prefix_recon_loss_fn, args=args)
+                             recon_decoders=recon_decoders, recon_loss_fn=recon_loss_fn, args=args,
+                             stage=stage, output_dir=args.output_dir)
 
         acc1 = val_stats.get("acc1", 0.0)
         recon_loss_val = val_stats.get("recon_total", val_stats.get("recon_pixel_avg", float("inf")))
@@ -1082,33 +1351,29 @@ def main(args):
     print(f"Best val acc@1: {best_acc1:.1f}%")
 
 
-if __name__ == "__main__":
-    args = get_args_parser().parse_args()
-
-    # Load config file if provided
-    if args.config:
-        with open(args.config, "r") as f:
-            config = yaml.safe_load(f)
-        # Config overrides argparse defaults, but explicit CLI args take precedence.
-        # We re-parse sys.argv to discover which args were explicitly provided.
-        parser = get_args_parser()
-        cli_specified = {action.dest for action in parser._actions
-                         if any(opt in sys.argv for opt in action.option_strings)}
-        for section in config.values():
-            if isinstance(section, dict):
-                for k, v in section.items():
-                    if hasattr(args, k) and k not in cli_specified:
-                        setattr(args, k, v)
-
-    if args.log_name is not None:
+def _cfg_to_args(cfg: DictConfig):
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+    args = SimpleNamespace(**cfg_dict)
+    if getattr(args, "log_name", None) is not None:
         args.output_dir = os.path.join(args.output_dir, args.log_name)
-    if args.log_dir is None:
+    if getattr(args, "log_dir", None) is None:
         args.log_dir = args.output_dir
+    return args
+
+
+@hydra.main(config_path="configs", config_name="config", version_base="1.3")
+def hydra_main(cfg: DictConfig):
+    args = _cfg_to_args(cfg)
+
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     if args.log_name is not None and HAS_WANDB and misc.is_main_process():
-        wandb.init(entity="project_vit", project="tvl-stage2", config=args,
+        wandb.init(entity="project_vit", project="tvl-stage2", config=OmegaConf.to_container(cfg, resolve=True),
                    name=args.log_name, sync_tensorboard=True)
 
-    main(args)
+    run(args)
+
+
+if __name__ == "__main__":
+    hydra_main()
