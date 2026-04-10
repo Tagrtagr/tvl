@@ -403,11 +403,13 @@ def main():
     loader = DataLoader(dataset, batch_size=args.n_samples, shuffle=False, num_workers=0)
     batch = next(iter(loader))
 
-    # Squeeze extra dims
+    # Remove only extra leading dims beyond the batch axis
     for k, v in batch.items():
         if isinstance(v, list):
             v = v[0]
-        batch[k] = v.squeeze()
+        if isinstance(v, torch.Tensor) and v.dim() > 4:
+            v = v.squeeze(0)
+        batch[k] = v
 
     # Check 1: Value ranges
     print("\n" + "-" * 40)

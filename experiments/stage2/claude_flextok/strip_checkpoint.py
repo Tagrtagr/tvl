@@ -87,8 +87,12 @@ def get_checkpoint_keys(path):
 def strip_checkpoint(input_path, output_path=None, keep_keys=None):
     """Load checkpoint, remove optimizer/scaler, re-save.
 
-    Uses torch.load but immediately frees heavy keys before any
-    downstream processing.
+    Args:
+        input_path: Path to the input checkpoint.
+        output_path: Path to write the stripped checkpoint. Defaults to
+            <input>.stripped.pth.
+        keep_keys: If provided, only these keys are retained in the output.
+            If None, all keys except {"optimizer", "scaler"} are kept.
     """
     import torch
     import gc
@@ -102,8 +106,9 @@ def strip_checkpoint(input_path, output_path=None, keep_keys=None):
 
     remove_keys = {"optimizer", "scaler"}
     if keep_keys:
-        # Only keep specified keys
-        pass
+        # keep_keys overrides the default remove list: drop everything not requested
+        keep_set = set(keep_keys)
+        remove_keys = set()  # will be computed after loading
 
     print(f"Input:  {input_path}")
     print(f"Input size: {os.path.getsize(input_path) / 1e9:.2f} GB")
@@ -117,8 +122,11 @@ def strip_checkpoint(input_path, output_path=None, keep_keys=None):
     print(f"\nLoading checkpoint...")
     ckpt = torch.load(input_path, map_location="cpu")
 
-    for key in list(ckpt.keys()):
-        if key in remove_keys:
+    if keep_keys:
+        remove_keys = {k for k in ckpt.keys() if k not in keep_set}
+
+    for key in list(remove_keys):
+        if key in ckpt:
             print(f"  Deleting '{key}'...")
             del ckpt[key]
             gc.collect()

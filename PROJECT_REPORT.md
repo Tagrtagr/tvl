@@ -42,7 +42,7 @@ Stage 2 addresses this by learning **register tokens** that compress encoder fea
 
 ### 2.1 System Diagram
 
-```
+```text
                           Stage 1 (Frozen)                    Stage 2 (Learned)
                     ┌─────────────────────┐           ┌──────────────────────────┐
   Vision Image ───► │  OpenCLIP ViT-L-14  │──768d──►  │  RegisterTokenModule     │
@@ -108,7 +108,7 @@ Stage 2 addresses this by learning **register tokens** that compress encoder fea
 
 ### 3.1 Files Created
 
-```
+```text
 experiments/stage2/claude_flextok/
 ├── configs/
 │   └── default.yaml                    # Full configuration template
@@ -244,7 +244,7 @@ stage1:
 
 ### 5.1 Stage 2a: Alignment Training
 - **Script**: `scripts/launch_stage2a.sh`
-- **Output**: `experiments/stage2/runs/stage2a_align/`
+- **Output**: `experiments/stage2/runs/stage2a_alignment/`
 - **Status**: Completed
 - **Config**: n_registers=32, n_shared=8, contrastive + preservation loss
 

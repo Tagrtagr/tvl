@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 
-OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "synthetic")
 
 # ── Reported data from PROJECT_REPORT.md ──
 PREFIX_LENGTHS = [1, 2, 4, 8, 16, 32]
@@ -520,6 +520,7 @@ def plot_token_info():
 # Main
 # ═══════════════════════════════════════════════════════════════════
 if __name__ == '__main__':
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     print(f'Generating visualizations in: {OUTPUT_DIR}\n')
 
     plot_prefix_mse()

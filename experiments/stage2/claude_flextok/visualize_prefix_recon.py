@@ -196,12 +196,23 @@ def load_model_and_decoders(checkpoint_path, stage1_checkpoint, n_registers=32,
         tactile_model=tactile_model,
         active_modalities=[ModalityType.VISION, ModalityType.TACTILE],
     )
-    if stage1_checkpoint and os.path.exists(stage1_checkpoint):
-        s1_ckpt = torch.load(stage1_checkpoint, map_location="cpu")
-        state = s1_ckpt.get("model", s1_ckpt)
-        frozen_encoder.load_state_dict(state, strict=False)
-        del s1_ckpt, state
-        gc.collect()
+    if not stage1_checkpoint or not os.path.exists(stage1_checkpoint):
+        raise ValueError(
+            f"A valid --stage1_checkpoint is required for visualization. "
+            f"Got: {stage1_checkpoint!r}"
+        )
+    s1_ckpt = torch.load(stage1_checkpoint, map_location="cpu")
+    state = s1_ckpt.get("model", s1_ckpt)
+    encoder_keys = set(frozen_encoder.state_dict().keys())
+    loaded_keys = set(state.keys())
+    if not encoder_keys.intersection(loaded_keys):
+        raise ValueError(
+            f"Stage 1 checkpoint does not contain expected encoder keys. "
+            f"Found keys: {list(loaded_keys)[:5]}"
+        )
+    frozen_encoder.load_state_dict(state, strict=False)
+    del s1_ckpt, state
+    gc.collect()
 
     # Convert frozen encoder to float16 to save ~750MB RAM
     frozen_encoder.half()

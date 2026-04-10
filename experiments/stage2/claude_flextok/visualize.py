@@ -214,6 +214,14 @@ def plot_training_curves(contrastive_log, recon_log, output_dir):
     print(f"Saved: {path}")
 
 
+def resolve_dataset_root(datasets_dir):
+    """Return the actual SSVTP root, handling both flat and nested layouts."""
+    if (os.path.exists(os.path.join(datasets_dir, "images_rgb")) or
+            os.path.exists(os.path.join(datasets_dir, "train.csv"))):
+        return datasets_dir
+    return os.path.join(datasets_dir, "ssvtp")
+
+
 # ─────────────────────────────────────────────────
 # Plot 2: Reconstruction samples (original vs reconstructed)
 # ─────────────────────────────────────────────────
@@ -279,10 +287,7 @@ def plot_reconstruction_samples(checkpoint_path, stage1_checkpoint, datasets_dir
         recon_decoders[mod_name] = dec
 
     # Load val data
-    root_dir = datasets_dir
-    if not (os.path.exists(os.path.join(root_dir, "images_rgb")) or
-            os.path.exists(os.path.join(root_dir, "train.csv"))):
-        root_dir = os.path.join(root_dir, "ssvtp")
+    root_dir = resolve_dataset_root(datasets_dir)
     dataset_val = TacVisDataset(
         root_dir=root_dir, split="val",
         transform_rgb=RGB_AUGMENTS, transform_tac=TAC_AUGMENTS,
@@ -436,10 +441,7 @@ def plot_tsne(checkpoint_path, stage1_checkpoint, datasets_dir,
     model.eval()
 
     # Load data
-    root_dir = datasets_dir
-    if not (os.path.exists(os.path.join(root_dir, "images_rgb")) or
-            os.path.exists(os.path.join(root_dir, "train.csv"))):
-        root_dir = os.path.join(root_dir, "ssvtp")
+    root_dir = resolve_dataset_root(datasets_dir)
     dataset_val = TacVisDataset(
         root_dir=root_dir, split="val",
         transform_rgb=RGB_AUGMENTS, transform_tac=TAC_AUGMENTS,
@@ -553,10 +555,7 @@ def plot_variable_length(checkpoint_path, stage1_checkpoint, datasets_dir,
     model.eval()
 
     # Load data
-    root_dir = datasets_dir
-    if not (os.path.exists(os.path.join(root_dir, "images_rgb")) or
-            os.path.exists(os.path.join(root_dir, "train.csv"))):
-        root_dir = os.path.join(root_dir, "ssvtp")
+    root_dir = resolve_dataset_root(datasets_dir)
     dataset_val = TacVisDataset(
         root_dir=root_dir, split="val",
         transform_rgb=RGB_AUGMENTS, transform_tac=TAC_AUGMENTS,

@@ -7,7 +7,7 @@
 #SBATCH --job-name=prefix_recon_vis
 #SBATCH --output=visualize_prefix_recon_%j.log
 
-cd /viscam/u/taarush/tvl
+cd /viscam/u/taarush/tvl || { echo "ERROR: Could not cd to /viscam/u/taarush/tvl"; exit 1; }
 
 python experiments/stage2/claude_flextok/visualize_prefix_recon.py \
     --checkpoint experiments/stage2/runs/stage2b_recon/stage2b_recon/checkpoint_best.pth \

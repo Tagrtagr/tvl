@@ -375,16 +375,13 @@ def _validate_stage1_checkpoint(checkpoint_path, tactile_model="vit_tiny_patch16
         return
 
     if not os.path.exists(checkpoint_path):
-        print("\n" + "!" * 60)
-        print(f"  ERROR: Stage 1 checkpoint NOT FOUND:")
-        print(f"    {checkpoint_path}")
-        print("  The frozen encoder will use RANDOM weights.")
-        print("  Common locations to check:")
-        print("    - /viscam/u/taarush/tvl_enc_vittiny.pth")
-        print("    - ./checkpoints/stage1/checkpoint_best.pth")
-        print("  Check that the file path is correct.")
-        print("!" * 60 + "\n")
-        return
+        raise FileNotFoundError(
+            f"Stage 1 checkpoint not found: {checkpoint_path}\n"
+            "Common locations:\n"
+            "  - /viscam/u/taarush/tvl_enc_vittiny.pth\n"
+            "  - ./checkpoints/stage1/checkpoint_best.pth\n"
+            "Pass the correct path via --stage1_checkpoint."
+        )
 
     file_size_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
     print(f"Stage 1 checkpoint: {checkpoint_path} ({file_size_mb:.1f} MB)")
@@ -800,13 +797,27 @@ def main(args):
     # Build datasets
     dataset_train, dataset_val = build_datasets(args)
 
-    # Overfit-to-one-sample debug mode
-    if args.overfit_one_sample:
-        print("=" * 60)
-        print("OVERFIT MODE: using a single training sample")
-        print("=" * 60)
-        dataset_train = torch.utils.data.Subset(dataset_train, [0])
-        dataset_val = torch.utils.data.Subset(dataset_val, [0])
+    # Overfit mode: reduce dataset to a single sample for debugging
+    if getattr(args, "overfit_one_sample", False):
+        print("\n" + "=" * 60)
+        print("  OVERFIT MODE: Training on a single data point")
+        print("  Augmentations DISABLED for deterministic input")
+        print("  Expected: loss should drop to ~0 within a few epochs")
+        print("  If it doesn't, there's a bug in architecture/loss/data pipeline")
+        print("=" * 60 + "\n")
+        # Rebuild dataset without augmentations so the network sees the exact
+        # same image every iteration (augmentations would change the target
+        # each step, preventing true overfitting).
+        dataset_name = args.datasets[0] if args.datasets else "ssvtp"
+        root_dir = os.path.join(args.datasets_dir, dataset_name)
+        dataset_overfit = TacVisDataset(
+            root_dir=root_dir, split="train",
+            transform_rgb=RGB_PREPROCESS, transform_tac=TAC_PREPROCESS,
+            modality_types=[ModalityType.VISION, ModalityType.TACTILE],
+            text_prompt="This image gives tactile feelings of ",
+        )
+        dataset_train = torch.utils.data.Subset(dataset_overfit, [0])
+        dataset_val = torch.utils.data.Subset(dataset_overfit, [0])
         args.batch_size = 1
         args.num_workers = 0
         # Disable distributed so we don't need multi-process setup
