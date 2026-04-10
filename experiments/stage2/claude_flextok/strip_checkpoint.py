@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Strip optimizer/scaler from a PyTorch checkpoint to reduce file size.
 
-This script processes the checkpoint zip file entry-by-entry, copying only
-the keys needed for inference (args, alignment_model, recon_decoder_*).
-It avoids loading the full checkpoint into memory, so it works on machines
-with limited RAM.
+This script loads the checkpoint with torch.load, removes heavy keys
+(optimizer, scaler) in-place, then re-saves. The get_checkpoint_keys()
+helper uses zipfile to peek at keys without loading tensors, but the
+actual stripping step still requires a full load. Run on a machine with
+enough RAM to hold the checkpoint (typically 2-4 GB for Stage 2).
 
 Usage:
     python experiments/stage2/claude_flextok/strip_checkpoint.py \
