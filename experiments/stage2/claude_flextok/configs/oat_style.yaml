@@ -1,33 +1,20 @@
-# OAT-style training configuration.
-#
-# Incorporates insights from Ordered Action Tokenization (OAT):
-#   - Token type embeddings to distinguish shared vs private tokens
-#   - Contrastive alignment with information preservation
-#   - Nested dropout with power-of-two schedule
-#
-# Note: Prefix reconstruction loss is available separately via --use_prefix_recon.
-# This config uses contrastive alignment + preservation only.
-#
-# Reference: https://ordered-action-tokenization.github.io/
+# Merged legacy config from configs/oat_style.yaml into Hydra conf/
 
-model:
-  hidden_dim: 512
-  n_registers: 32
-  n_shared: 8
-  n_layers: 4
-  n_heads: 8
-  model_dropout: 0.1
-  nested_dropout: true
-  nested_dropout_mode: "power_of_two"
+hidden_dim: 768
+n_registers: 32
+n_shared: 8
+n_layers: 4
+n_heads: 8
+model_dropout: 0.1
+nested_dropout: true
+nested_dropout_mode: power_of_two
 
-loss:
-  loss_type: "contrastive"
-  contrastive_weight: 1.0
-  preservation_weight: 0.5
+loss_type: contrastive
+contrastive_weight: 1.0
+preservation_weight: 0.5
 
-training:
-  epochs: 100
-  batch_size: 256
-  blr: 3.0e-4
-  warmup_epochs: 10
-  seed: 42
+epochs: 100
+batch_size: 256
+blr: 3.0e-4
+warmup_epochs: 10
+seed: 42

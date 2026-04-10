@@ -67,7 +67,7 @@ DATASETS=("ssvtp" "hct")
 OUTPUT_ROOT="./output/stage2_flextok"
 
 # Common training defaults (override via flags below if needed)
-BATCH_SIZE="${BATCH_SIZE:-256}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
 EPOCHS_ALIGN="${EPOCHS_ALIGN:-100}"
 EPOCHS_RECON="${EPOCHS_RECON:-100}"
 NUM_WORKERS="${NUM_WORKERS:-10}"
@@ -292,29 +292,31 @@ ALIGN_CKPT="${ALIGN_OUT}/checkpoint_best.pth"
 
 mkdir -p "${ALIGN_OUT}" "${RECON_OUT}"
 
+DATASETS_YAML="[$(IFS=,; echo "${DATASETS[*]}")]"
+
 ALIGN_ARGS=(
-  --stage alignment
-  --stage1_checkpoint "${STAGE1_CHECKPOINT}"
-  --datasets_dir "${DATASETS_DIR}"
-  --datasets "${DATASETS[@]}"
-  --tactile_model "${TAC_MODEL}"
-  --batch_size "${BATCH_SIZE}"
-  --epochs "${EPOCHS_ALIGN}"
-  --num_workers "${NUM_WORKERS}"
-  --output_dir "${ALIGN_OUT}"
-  --loss_type "contrastive"
-  --save_recon_images
+  stage=alignment
+  stage1_checkpoint="${STAGE1_CHECKPOINT}"
+  datasets_dir="${DATASETS_DIR}"
+  datasets="${DATASETS_YAML}"
+  tactile_model="${TAC_MODEL}"
+  batch_size="${BATCH_SIZE}"
+  epochs="${EPOCHS_ALIGN}"
+  num_workers="${NUM_WORKERS}"
+  output_dir="${ALIGN_OUT}"
+  loss_type=contrastive
+  save_recon_images=true
 )
 
 if [[ -n "${SUBTRACT_BACKGROUND}" ]]; then
-  ALIGN_ARGS+=(--subtract_background "${SUBTRACT_BACKGROUND}")
+  ALIGN_ARGS+=(subtract_background="${SUBTRACT_BACKGROUND}")
 fi
 
 echo "============================================================"
 echo "Stage 2a: ALIGNMENT"
 echo "Output: ${ALIGN_OUT}"
 echo "============================================================"
-"${PYTHON_BIN}" "${TRAIN_PY}" "${ALIGN_ARGS[@]}"
+"${PYTHON_BIN}" "${TRAIN_PY}" --config-name config "${ALIGN_ARGS[@]}"
 
 if [[ ! -f "${ALIGN_CKPT}" ]]; then
   echo "ERROR: alignment checkpoint not found at: ${ALIGN_CKPT}" >&2
@@ -323,28 +325,28 @@ if [[ ! -f "${ALIGN_CKPT}" ]]; then
 fi
 
 RECON_ARGS=(
-  --stage reconstruction
-  --alignment_checkpoint "${ALIGN_CKPT}"
-  --stage1_checkpoint "${STAGE1_CHECKPOINT}"
-  --datasets_dir "${DATASETS_DIR}"
-  --datasets "${DATASETS[@]}"
-  --tactile_model "${TAC_MODEL}"
-  --decoder_type "${DECODER_TYPE}"
-  --use_prefix_recon
-  --prefix_recon_weight "0.5"
-  --reconstruction_weight "${RECON_WEIGHT}"
-  --recon_loss_type "${RECON_LOSS_TYPE}"
-  --recon_base_channels "${RECON_BASE_CHANNELS}"
-  --recon_decoder_layers "${RECON_DECODER_LAYERS}"
-  --batch_size "${BATCH_SIZE}"
-  --epochs "${EPOCHS_RECON}"
-  --num_workers "${NUM_WORKERS}"
-  --output_dir "${RECON_OUT}"
-  --save_recon_images
+  stage=reconstruction
+  alignment_checkpoint="${ALIGN_CKPT}"
+  stage1_checkpoint="${STAGE1_CHECKPOINT}"
+  datasets_dir="${DATASETS_DIR}"
+  datasets="${DATASETS_YAML}"
+  tactile_model="${TAC_MODEL}"
+  decoder_type="${DECODER_TYPE}"
+  use_prefix_recon=true
+  prefix_recon_weight=0.5
+  reconstruction_weight="${RECON_WEIGHT}"
+  recon_loss_type="${RECON_LOSS_TYPE}"
+  recon_base_channels="${RECON_BASE_CHANNELS}"
+  recon_decoder_layers="${RECON_DECODER_LAYERS}"
+  batch_size="${BATCH_SIZE}"
+  epochs="${EPOCHS_RECON}"
+  num_workers="${NUM_WORKERS}"
+  output_dir="${RECON_OUT}"
+  save_recon_images=true
 )
 
 if [[ -n "${SUBTRACT_BACKGROUND}" ]]; then
-  RECON_ARGS+=(--subtract_background "${SUBTRACT_BACKGROUND}")
+  RECON_ARGS+=(subtract_background="${SUBTRACT_BACKGROUND}")
 fi
 
 echo "============================================================"
@@ -352,6 +354,6 @@ echo "Stage 2b: RECONSTRUCTION"
 echo "Alignment checkpoint: ${ALIGN_CKPT}"
 echo "Output: ${RECON_OUT}"
 echo "============================================================"
-"${PYTHON_BIN}" "${TRAIN_PY}" "${RECON_ARGS[@]}"
+"${PYTHON_BIN}" "${TRAIN_PY}" --config-name config "${RECON_ARGS[@]}"
 
 echo "Done."
