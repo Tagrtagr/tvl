@@ -140,6 +140,7 @@ class CrossModalAlignmentModel(nn.Module):
         nested_dropout_mode: str = "power_of_two",
         init_logit_scale: float = np.log(1 / 0.07),
         use_token_type_embed: bool = True,
+        private_dropout_p: float = 0.0,
         fsq_levels: Optional[List[int]] = None,
         fsq_drop_quant_p: float = 0.0,
     ):
@@ -176,6 +177,7 @@ class CrossModalAlignmentModel(nn.Module):
                 nested_dropout=nested_dropout,
                 nested_dropout_mode=nested_dropout_mode,
                 use_token_type_embed=use_token_type_embed,
+                private_dropout_p=private_dropout_p,
             )
 
         self.feature_types = {k: v["feature_type"] for k, v in modality_configs.items()}

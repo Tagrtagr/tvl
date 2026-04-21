@@ -1,0 +1,22 @@
+encoder:
+  type: tvl  # tvl | vae
+  tvl:
+    tactile_model: ${tactile_model}
+    stage1_checkpoint: ${stage1_checkpoint}
+  vae:
+    vae_checkpoint: ${vae_checkpoint}
+    vae_latent_channels: ${vae_latent_channels}
+    vae_scaling_factor: ${vae_scaling_factor}
+
+tokenizer:
+  _target_: pipeline.stage2_pipeline.IdentityTokenizer
+
+structure:
+  has_modality_encoder: true
+  has_register_tokens: true
+  has_cross_modality_encoder: true
+  has_fsq_tokenizer: true
+  has_decoder: true
+
+freeze_policy:
+  reconstruction_freeze_modules: [cross_modality_encoder]

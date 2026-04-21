@@ -49,6 +49,7 @@ class Registers1D(nn.Module):
         nested_dropout: bool = True,
         nested_dropout_mode: str = "power_of_two",
         use_token_type_embed: bool = True,
+        private_dropout_p: float = 0.0,
     ):
         super().__init__()
         assert n_shared <= n_registers, "n_shared must be <= n_registers"
@@ -59,6 +60,7 @@ class Registers1D(nn.Module):
         self.nested_dropout = bool(nested_dropout)
         self.nested_dropout_mode = str(nested_dropout_mode)
         self.use_token_type_embed = bool(use_token_type_embed)
+        self.private_dropout_p = float(private_dropout_p)
 
         # Learnable register tokens
         self.register_tokens = nn.Parameter(torch.randn(1, n_registers, hidden_dim) * 0.02)
@@ -136,6 +138,31 @@ class Registers1D(nn.Module):
         regs = registers.clone()
         regs[:, k_keep:self.n_shared, :] = 0.0
         return regs, k_keep
+
+    def apply_private_token_dropout(
+        self,
+        registers: torch.Tensor,
+        *,
+        apply: bool,
+    ) -> torch.Tensor:
+        """Apply token-wise dropout on private registers only."""
+        if (not apply) or self.n_private <= 0 or self.private_dropout_p <= 0.0:
+            return registers
+
+        keep_prob = 1.0 - self.private_dropout_p
+        regs = registers.clone()
+        # Token-wise dropout mask for private tokens; scaled to keep expectation.
+        mask = (
+            torch.rand(
+                regs.shape[0],
+                self.n_private,
+                1,
+                device=regs.device,
+                dtype=regs.dtype,
+            ) < keep_prob
+        ).to(regs.dtype)
+        regs[:, self.n_shared :, :] = regs[:, self.n_shared :, :] * mask / keep_prob
+        return regs
 
 
 class RegisterTokenTransformer(nn.Module):
@@ -232,6 +259,7 @@ class RegisterTokenModule(nn.Module):
         nested_dropout: bool = True,
         nested_dropout_mode: str = "power_of_two",
         use_token_type_embed: bool = True,
+        private_dropout_p: float = 0.0,
     ):
         super().__init__()
         assert n_shared <= n_registers, "n_shared must be <= n_registers"
@@ -247,6 +275,7 @@ class RegisterTokenModule(nn.Module):
         self.nested_dropout = nested_dropout
         self.nested_dropout_mode = nested_dropout_mode
         self.use_token_type_embed = use_token_type_embed
+        self.private_dropout_p = private_dropout_p
 
         self.registers = Registers1D(
             hidden_dim=hidden_dim,
@@ -255,6 +284,7 @@ class RegisterTokenModule(nn.Module):
             nested_dropout=nested_dropout,
             nested_dropout_mode=nested_dropout_mode,
             use_token_type_embed=use_token_type_embed,
+            private_dropout_p=private_dropout_p,
         )
         self.transformer = RegisterTokenTransformer(
             hidden_dim=hidden_dim,
@@ -302,6 +332,7 @@ class RegisterTokenModule(nn.Module):
             else (self.nested_dropout and self.training)
         )
         register_out, k_keep = self.registers.apply_shared_nested_dropout(register_out, apply=use_dropout)
+        register_out = self.registers.apply_private_token_dropout(register_out, apply=use_dropout)
 
         shared_tokens = register_out[:, : self.n_shared, :]
         private_tokens = register_out[:, self.n_shared :, :]

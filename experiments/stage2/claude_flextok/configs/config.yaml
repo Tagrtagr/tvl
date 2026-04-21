@@ -1,11 +1,15 @@
-# Hydra config for Stage 2 cross-modality alignment training
+defaults:
+  - pipeline: default
+  - model: default
+  - losses: default
+  - _self_
 
 hydra:
   run:
     dir: .
   output_subdir: null
 
-# Model
+# Core model dimensions
 hidden_dim: 512
 n_registers: 32
 n_shared: 8
@@ -13,37 +17,17 @@ n_layers: 4
 n_heads: 8
 model_dropout: 0.1
 nested_dropout: true
-nested_dropout_mode: power_of_two  # power_of_two | uniform
+nested_dropout_mode: power_of_two
+use_token_type_embed: true
 
-# Loss
-loss_type: contrastive  # contrastive | flow_matching | combined
-use_flow_matching_alignment_loss: false
-contrastive_weight: 1.0
-preservation_weight: 0.5
-flow_weight: 0.5
-
-# Reconstruction
-reconstruction_weight: 1.0
+# Decoder defaults (consumed by model group)
 recon_base_channels: 64
 recon_decoder_layers: 2
-recon_loss_type: mse  # mse | l1 | smooth_l1
-save_recon_images: true
-recon_save_every: 5
-recon_save_max_batches: 1
-flow_recon_steps: 20
-flow_recon_pixel_mse_weight: 1.0
-
-# OAT-style prefix reconstruction
-use_prefix_recon: false
-prefix_recon_weight: 0.5
-
-# Token type embeddings (OAT-inspired)
-use_token_type_embed: true
+decoder_type: autoregressive  # conv | autoregressive | flow_matching
 
 # Stage split
 stage: joint  # alignment | reconstruction | joint
 alignment_checkpoint: null
-decoder_type: autoregressive  # conv | autoregressive | flow_matching
 
 # Training
 batch_size: 64
@@ -56,9 +40,9 @@ warmup_epochs: 0
 weight_decay: 0.05
 seed: 42
 
-# Stage 1 / backbone
+# Backbone inputs (referenced by pipeline group)
 stage1_checkpoint: null
-tactile_model: vit_tiny_patch16_224  # vit_base_patch16_224 | vit_small_patch16_224 | vit_tiny_patch16_224
+tactile_model: vit_tiny_patch16_224
 feature_backbone: encoders  # encoders | vae
 vae_checkpoint: null
 vae_latent_channels: 4
@@ -67,20 +51,26 @@ vae_scaling_factor: 0.18215
 # Data
 datasets_dir: ./.datasets
 datasets: [ssvtp, hct]
-subtract_background: null  # null | mean | median | background
+subtract_background: null
 num_workers: 10
 pin_mem: true
 
-# Debug (single-sample overfit sanity check)
+# Debug
 debug_single_sample: false
-debug_sample_selector: null      # null -> auto pick first sample; or set substring key/path
-debug_max_train_samples: 1       # in debug mode, cap train samples to this value (1 => exactly one pair)
-debug_dataset_mode: repeat_cached       # filter | repeat_cached
-debug_repeat_size: 4096          # used when debug_dataset_mode=repeat_cached
-debug_num_workers: 0             # override num_workers in debug mode (0 usually fastest for single-sample)
+debug_sample_selector: null
+debug_max_train_samples: 1
+debug_dataset_mode: repeat_cached
+debug_repeat_size: 512
+debug_num_workers: 0
+
+# Recon/eval logging
+save_recon_images: true
+recon_save_every: 5
+recon_save_max_batches: 1
+flow_recon_steps: 20
 
 # Output
-output_dir: ./output/stage2
+output_dir: ./output/with_alignment_loss
 log_dir: null
 log_name: null
 resume: ""

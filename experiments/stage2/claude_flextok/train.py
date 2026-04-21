@@ -85,15 +85,11 @@ from tvl_enc.tacvis import (
     RGB_MEAN, RGB_STD, TAC_MEAN, TAC_STD, TAC_MEAN_BG, TAC_STD_BG,
 )
 
-from models.cross_modal_alignment import CrossModalAlignmentModel, Stage2Wrapper
 from models.reconstruction_decoder import ReconstructionDecoder
 from models.autoregressive_decoder import AutoregressiveDecoder
 from models.flow_matching_decoder import FlowMatchingReconstructionDecoder
-from models.simple_vae import VAEFeatureBackbone
-from losses.alignment_loss import CrossModalAlignmentLoss
-from losses.flow_matching import FlowMatchingAlignmentLoss
-from losses.reconstruction_loss import ReconstructionLoss
 from losses.flow_reconstruction_loss import FlowReconstructionLoss
+from pipeline.stage2_pipeline import Stage2Pipeline, DecoderCollection, build_modality_encoder
 
 try:
     import wandb
@@ -159,6 +155,12 @@ def get_args_parser():
                         help="Training stage: 'alignment' trains register tokens only, "
                              "'reconstruction' freezes alignment and trains decoder only, "
                              "'joint' trains both together (legacy)")
+    parser.add_argument(
+        "--alignment_recon_only",
+        action="store_true",
+        default=False,
+        help="Deprecated: use `losses=alignment_recon_only` to skip alignment losses (config-driven).",
+    )
     parser.add_argument("--alignment_checkpoint", type=str, default=None,
                         help="Path to alignment stage checkpoint (for --stage reconstruction)")
     parser.add_argument("--decoder_type", type=str, default="autoregressive",
@@ -409,6 +411,13 @@ def build_datasets(args):
             )
             print(f"[debug_single_sample][val][{i}] sample='{selected_sample}' {n0} -> {n1} samples")
 
+        # ConcatDataset caches cumulative sizes at construction time.
+        # Rebuild it after mutating component dataset lengths in debug mode.
+        if isinstance(train_ds, ConcatDataset):
+            train_ds = ConcatDataset(list(_iter_components(train_ds)))
+        if isinstance(val_ds, ConcatDataset):
+            val_ds = ConcatDataset(list(_iter_components(val_ds)))
+
         if debug_dataset_mode == "repeat_cached":
             train_before = len(train_ds)
             val_before = len(val_ds)
@@ -424,97 +433,110 @@ def build_datasets(args):
     return train_ds, val_ds
 
 
-def build_model(args, device):
-    """Build frozen backbone + Stage 2 alignment model."""
-    if getattr(args, "feature_backbone", "encoders") == "vae":
-        # Build frozen VAE feature backbone
-        frozen_encoder = VAEFeatureBackbone(
-            hidden_dim=768,
-            latent_channels=args.vae_latent_channels,
-            scaling_factor=args.vae_scaling_factor,
-        )
-        if not args.vae_checkpoint or not os.path.exists(args.vae_checkpoint):
-            raise FileNotFoundError(
-                "--feature_backbone vae requires a valid --vae_checkpoint"
-            )
-        print(f"Loading pretrained VAE checkpoint from {args.vae_checkpoint}")
-        missing, unexpected = frozen_encoder.load_pretrained_checkpoint(
-            args.vae_checkpoint,
-            strict=False,
-        )
-        if missing:
-            print(f"[warn] VAE missing keys: {len(missing)}")
-        if unexpected:
-            print(f"[warn] VAE unexpected keys: {len(unexpected)}")
+def _to_plain_dict(cfg_obj):
+    if cfg_obj is None:
+        return {}
+    if isinstance(cfg_obj, DictConfig):
+        return OmegaConf.to_container(cfg_obj, resolve=True)
+    return cfg_obj
 
-        modality_configs = {
-            ModalityType.VISION: {"input_dim": frozen_encoder.hidden_dim, "feature_type": "sequence"},
-            ModalityType.TACTILE: {"input_dim": frozen_encoder.hidden_dim, "feature_type": "sequence"},
-        }
+
+def _build_modality_configs(modality_encoder):
+    if hasattr(modality_encoder, "hidden_dim"):
+        vision_dim = modality_encoder.hidden_dim
+        tactile_dim = modality_encoder.hidden_dim
     else:
-        # Build frozen Stage 1 encoders
-        frozen_encoder = TVL(
-            tactile_model=args.tactile_model,
-            active_modalities=[ModalityType.VISION, ModalityType.TACTILE],
+        vision_dim = (
+            modality_encoder.clip.visual.output_dim
+            if hasattr(modality_encoder.clip.visual, "output_dim")
+            else 768
         )
+        tactile_dim = (
+            modality_encoder.tactile_encoder.num_classes
+            if modality_encoder.tactile_encoder.num_classes > 0
+            else modality_encoder.tactile_encoder.num_features
+        )
+    return {
+        ModalityType.VISION: {"input_dim": vision_dim, "feature_type": "sequence"},
+        ModalityType.TACTILE: {"input_dim": tactile_dim, "feature_type": "sequence"},
+    }
 
-        # Load Stage 1 checkpoint if provided
-        if args.stage1_checkpoint and os.path.exists(args.stage1_checkpoint):
-            print(f"Loading Stage 1 checkpoint from {args.stage1_checkpoint}")
-            ckpt = torch.load(args.stage1_checkpoint, map_location="cpu", weights_only=False)
-            if "model" in ckpt:
-                frozen_encoder.load_state_dict(ckpt["model"], strict=False)
-            else:
-                frozen_encoder.load_state_dict(ckpt, strict=False)
 
-        # Determine input dims from the frozen encoder
-        # Vision: OpenCLIP ViT-L-14 outputs 768-dim
-        # Tactile: depends on tactile_model + whether num_classes matches CLIP width
-        vision_dim = frozen_encoder.clip.visual.output_dim if hasattr(frozen_encoder.clip.visual, "output_dim") else 768
-        tactile_dim = frozen_encoder.tactile_encoder.num_classes if frozen_encoder.tactile_encoder.num_classes > 0 else frozen_encoder.tactile_encoder.num_features
+def build_pipeline_from_cfg(args, device):
+    feature_backbone = "vae" if getattr(args, "feature_backbone", "encoders") == "vae" else "tvl"
+    modality_encoder = build_modality_encoder(
+        feature_backbone=feature_backbone,
+        tactile_model=args.tactile_model,
+        stage1_checkpoint=args.stage1_checkpoint if args.stage1_checkpoint and os.path.exists(args.stage1_checkpoint) else None,
+        vae_checkpoint=args.vae_checkpoint if args.vae_checkpoint and os.path.exists(args.vae_checkpoint) else None,
+        vae_latent_channels=args.vae_latent_channels,
+        vae_scaling_factor=args.vae_scaling_factor,
+    )
+    modality_configs = _build_modality_configs(modality_encoder)
 
-        modality_configs = {
-            ModalityType.VISION: {"input_dim": vision_dim, "feature_type": "sequence"},
-            ModalityType.TACTILE: {"input_dim": tactile_dim, "feature_type": "sequence"},
-        }
-
-    # Build Stage 2 alignment model
-    use_token_type = getattr(args, "use_token_type_embed", True)
-    alignment_model = CrossModalAlignmentModel(
+    model_cfg = _to_plain_dict(getattr(args, "model", {}))
+    cross_cfg = model_cfg.get("register_cross_modal", {})
+    if not cross_cfg:
+        raise ValueError("Missing model.register_cross_modal config.")
+    cross_modality_encoder = hydra.utils.instantiate(
+        cross_cfg,
         modality_configs=modality_configs,
-        n_registers=args.n_registers,
-        n_shared=args.n_shared,
-        n_layers=args.n_layers,
-        n_heads=args.n_heads,
-        dropout=args.model_dropout,
-        nested_dropout=args.nested_dropout,
-        nested_dropout_mode=args.nested_dropout_mode,
-        use_token_type_embed=use_token_type,
+        _convert_="all",
     )
 
-    # Wrap into Stage 2 pipeline
-    model = Stage2Wrapper(frozen_encoder, alignment_model)
-    model.to(device)
+    tokenizer_cfg = _to_plain_dict(getattr(args, "pipeline", {})).get("tokenizer", {})
+    tokenizer = hydra.utils.instantiate(tokenizer_cfg, _convert_="all") if tokenizer_cfg else None
 
+    model = Stage2Pipeline(
+        modality_encoder=modality_encoder,
+        cross_modality_encoder=cross_modality_encoder,
+        tokenizer=tokenizer,
+        decoder_collection=None,
+    )
+    model.to(device)
     return model
 
 
 def build_loss(args, device, embed_dim):
-    """Build loss function(s) based on configuration."""
+    """Build loss modules from structured Hydra config groups."""
     modality_names = [ModalityType.VISION, ModalityType.TACTILE]
+    losses_cfg = _to_plain_dict(getattr(args, "losses", {}))
+    alignment_cfg = losses_cfg.get("alignment", {})
+    reconstruction_cfg = losses_cfg.get("reconstruction", {})
+    contrastive_cfg = alignment_cfg.get("contrastive")
+    flow_cfg = alignment_cfg.get("flow_matching")
 
-    contrastive_loss = CrossModalAlignmentLoss(
-        modality_names=modality_names,
-        contrastive_weight=args.contrastive_weight,
-        preservation_weight=args.preservation_weight,
-    ).to(device)
+    contrastive_loss = None
+    # Overall scaling factor (config-level). The loss module itself already
+    # uses contrastive_weight/preservation_weight internally.
+    args.contrastive_weight = getattr(args, "contrastive_weight", 1.0)
+    if contrastive_cfg:
+        args.contrastive_weight = float(contrastive_cfg.get("weight", getattr(args, "contrastive_weight", 1.0)))
+        contrastive_module_cfg = contrastive_cfg.get("module", {})
+        cfg_latent_dim = contrastive_module_cfg.get("latent_dim", None)
+        if cfg_latent_dim is not None and int(cfg_latent_dim) != int(embed_dim):
+            print(
+                f"[loss] override contrastive latent_dim {cfg_latent_dim} -> {embed_dim} "
+                "to match cross-modality hidden dimension"
+            )
+        contrastive_module_cfg["latent_dim"] = int(embed_dim)
+        contrastive_loss = hydra.utils.instantiate(
+            contrastive_module_cfg,
+            modality_names=modality_names,
+            _convert_="all",
+        ).to(device)
 
     flow_loss = None
-    if getattr(args, "use_flow_matching_alignment_loss", False) and args.loss_type in ["flow_matching", "combined"]:
-        flow_loss = FlowMatchingAlignmentLoss(
+    if flow_cfg:
+        args.flow_weight = flow_cfg.get("weight", getattr(args, "flow_weight", 1.0))
+        flow_loss = hydra.utils.instantiate(
+            flow_cfg.get("module", {}),
             modality_names=modality_names,
             embed_dim=embed_dim,
+            _convert_="all",
         ).to(device)
+
+    args.reconstruction_weight = reconstruction_cfg.get("weight", getattr(args, "reconstruction_weight", 1.0))
 
     return contrastive_loss, flow_loss
 
@@ -599,7 +621,7 @@ def train_one_epoch(
     model.train()
     # Keep frozen encoder in eval mode
     model_inner = _unwrap(model)
-    model_inner.frozen_encoder.eval()
+    model_inner.modality_encoder.eval()
     if recon_decoders is not None:
         for dec in recon_decoders.values():
             dec.train()
@@ -635,16 +657,16 @@ def train_one_epoch(
             # In reconstruction stage, alignment is frozen — skip graph building
             if stage == "reconstruction":
                 with torch.no_grad():
-                    alignment_output = model_inner.alignment_model(frozen_features)
+                    alignment_output = model_inner.cross_modality_encoder(frozen_features)
             else:
-                alignment_output = model_inner.alignment_model(frozen_features)
+                alignment_output = model_inner.cross_modality_encoder(frozen_features)
 
             loss = torch.tensor(0.0, device=device)
             loss_dict = {}
 
-            # Contrastive + preservation loss (alignment and joint stages)
-            if stage != "reconstruction":
-                preservation_projectors = model_inner.alignment_model.preservation_projectors
+            # Alignment losses (config-driven: only computed if loss modules exist)
+            if stage != "reconstruction" and contrastive_loss_fn is not None:
+                preservation_projectors = model_inner.cross_modality_encoder.preservation_projectors
                 align_dict = contrastive_loss_fn(
                     alignment_output,
                     frozen_features=frozen_features,
@@ -652,15 +674,20 @@ def train_one_epoch(
                     input_images=samples,
                     output_dict=True,
                 )
+                # Optional config-level scaling for the whole alignment module
+                if hasattr(args, "contrastive_weight") and args.contrastive_weight is not None:
+                    align_dict["total_loss"] = args.contrastive_weight * align_dict["total_loss"]
                 loss = align_dict["total_loss"]
                 loss_dict.update(align_dict)
 
                 # Flow matching loss (if enabled)
-                if flow_loss_fn is not None:
-                    flow_dict = flow_loss_fn(alignment_output, output_dict=True)
-                    flow_loss = flow_dict.get("flow_total", torch.tensor(0.0, device=device))
-                    loss = loss + args.flow_weight * flow_loss
-                    loss_dict["flow_loss"] = flow_loss
+                # Note: this is kept separate so flow loss can be used even if
+                # contrastive loss is disabled.
+            if stage != "reconstruction" and flow_loss_fn is not None:
+                flow_dict = flow_loss_fn(alignment_output, output_dict=True)
+                flow_loss = flow_dict.get("flow_total", torch.tensor(0.0, device=device))
+                loss = loss + args.flow_weight * flow_loss
+                loss_dict["flow_loss"] = flow_loss
 
             # Reconstruction loss (alignment / reconstruction / joint stages)
             if recon_decoders is not None and recon_loss_fn is not None:
@@ -705,7 +732,7 @@ def train_one_epoch(
         loss /= accum_iter
 
         # Collect trainable parameters (filtered by requires_grad for stage support)
-        trainable_params = list(model_inner.alignment_model.parameters())
+        trainable_params = list(model_inner.cross_modality_encoder.parameters())
         if flow_loss_fn is not None:
             trainable_params += list(flow_loss_fn.parameters())
         if recon_decoders is not None:
@@ -742,7 +769,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate(
-    data_loader, contrastive_loss_fn, model, device, epoch=None, log_writer=None,
+    data_loader, contrastive_loss_fn, flow_loss_fn, model, device, epoch=None, log_writer=None,
     recon_decoders=None, recon_loss_fn=None, args=None,
     stage="joint", output_dir=None,
 ):
@@ -750,6 +777,7 @@ def evaluate(
     header = "Test:"
     model.eval()
     model_inner = _unwrap(model)
+    debug_single_sample = bool(getattr(args, "debug_single_sample", False))
     if recon_decoders is not None:
         for dec in recon_decoders.values():
             dec.eval()
@@ -758,20 +786,40 @@ def evaluate(
         for k, v in batch.items():
             if isinstance(v, list):
                 v = v[0]
+            if debug_single_sample and isinstance(v, torch.Tensor):
+                # In debug mode, validate exactly one sample instead of a full batch.
+                v = v[:1]
             batch[k] = v.to(device, non_blocking=True)
             batch_size = v.shape[0]
 
         with torch.cuda.amp.autocast():
             frozen_features = model_inner.encode(batch)
-            alignment_output = model_inner.alignment_model(frozen_features)
-            preservation_projectors = model_inner.alignment_model.preservation_projectors
-            loss_dict = contrastive_loss_fn(
-                alignment_output,
-                frozen_features=frozen_features,
-                preservation_projectors=preservation_projectors,
-                input_images=batch,
-                output_dict=True,
-            )
+            alignment_output = model_inner.cross_modality_encoder(frozen_features)
+            preservation_projectors = model_inner.cross_modality_encoder.preservation_projectors
+            loss_dict = {}
+            alignment_total = torch.tensor(0.0, device=device)
+
+            if contrastive_loss_fn is not None:
+                contrastive_dict = contrastive_loss_fn(
+                    alignment_output,
+                    frozen_features=frozen_features,
+                    preservation_projectors=preservation_projectors,
+                    input_images=batch,
+                    output_dict=True,
+                )
+                if hasattr(args, "contrastive_weight") and args.contrastive_weight is not None:
+                    contrastive_dict["total_loss"] = args.contrastive_weight * contrastive_dict["total_loss"]
+                loss_dict.update(contrastive_dict)
+                alignment_total = contrastive_dict.get("total_loss", alignment_total)
+
+            if flow_loss_fn is not None:
+                flow_dict = flow_loss_fn(alignment_output, output_dict=True)
+                loss_dict.update(flow_dict)
+                flow_total = flow_dict.get("flow_total", torch.tensor(0.0, device=device))
+                flow_weight = getattr(args, "flow_weight", 1.0)
+                alignment_total = alignment_total + flow_weight * flow_total
+
+            loss_dict["total_loss"] = alignment_total
 
             # Reconstruction loss (if enabled)
             if recon_decoders is not None and recon_loss_fn is not None:
@@ -817,8 +865,11 @@ def evaluate(
             )
 
 
-        loss = loss_dict["total_loss"]
+        base_total = loss_dict.get("total_loss")
         recon_total = loss_dict.get("recon_total")
+        loss = torch.tensor(0.0, device=device)
+        if base_total is not None:
+            loss = base_total
         if recon_total is not None:
             recon_weight = args.reconstruction_weight if args is not None else 1.0
             loss = loss + recon_weight * recon_total
@@ -835,6 +886,9 @@ def evaluate(
             if k not in ("total_loss", "acc1_avg", "acc5_avg") and isinstance(v, torch.Tensor):
                 metric_logger.update(**{k: v.item()})
 
+        if debug_single_sample:
+            break
+
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
 
@@ -843,6 +897,46 @@ def evaluate(
             log_writer.add_scalar(f"val_{k}", meter.global_avg, epoch)
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+def _resolve_resume_checkpoint(args) -> Optional[str]:
+    """Resolve resume checkpoint path from --resume setting.
+
+    Supports:
+      - explicit checkpoint path (existing file)
+      - auto mode (resume=true/auto/1/yes): search under output_dir
+    """
+    resume_value = getattr(args, "resume", "")
+    if resume_value is None:
+        return None
+
+    resume_str = str(resume_value).strip()
+    if not resume_str:
+        return None
+
+    if os.path.isfile(resume_str):
+        return resume_str
+
+    auto_tokens = {"1", "true", "yes", "y", "auto"}
+    if resume_str.lower() not in auto_tokens:
+        print(f"[resume] checkpoint not found: {resume_str}")
+        return None
+
+    if not getattr(args, "output_dir", None):
+        print("[resume] output_dir is empty; cannot auto-resume")
+        return None
+
+    output_dir = Path(args.output_dir)
+    latest_ckpt = output_dir / "checkpoint_latest.pth"
+    best_ckpt = output_dir / "checkpoint_best.pth"
+
+    if latest_ckpt.exists():
+        return str(latest_ckpt)
+    if best_ckpt.exists():
+        return str(best_ckpt)
+
+    print(f"[resume] no checkpoint found in {output_dir}")
+    return None
 
 
 def run(args):
@@ -899,87 +993,83 @@ def run(args):
         print("[single-sample] Reusing training dataloader for evaluation")
         data_loader_val = data_loader_train
 
-    # Build model
-    model = build_model(args, device)
+    # Build pipeline model
+    model = build_pipeline_from_cfg(args, device)
     model_without_ddp = model
 
     # --- Training stage handling ---
     stage = getattr(args, "stage", "joint")
     if stage == "reconstruction":
-        # Load and freeze alignment model for decoder-only training
+        # Load and freeze cross-modality encoder for decoder-only training
         if not args.alignment_checkpoint or not os.path.exists(args.alignment_checkpoint):
             raise FileNotFoundError(
                 "--stage reconstruction requires a valid --alignment_checkpoint"
             )
         print(f"Loading alignment checkpoint: {args.alignment_checkpoint}")
         align_ckpt = torch.load(args.alignment_checkpoint, map_location="cpu")
-        if "alignment_model" not in align_ckpt:
-            raise KeyError("alignment checkpoint is missing 'alignment_model' key")
-        model_without_ddp.alignment_model.load_state_dict(
-            align_ckpt["alignment_model"], strict=False,
+        encoder_state = align_ckpt.get("cross_modality_encoder", align_ckpt.get("alignment_model"))
+        if encoder_state is None:
+            raise KeyError("alignment checkpoint is missing 'cross_modality_encoder' (or legacy 'alignment_model') key")
+        model_without_ddp.cross_modality_encoder.load_state_dict(
+            encoder_state, strict=False,
         )
-        for p in model_without_ddp.alignment_model.parameters():
+        for p in model_without_ddp.cross_modality_encoder.parameters():
             p.requires_grad = False
-        n_frozen = sum(p.numel() for p in model_without_ddp.alignment_model.parameters())
+        n_frozen = sum(p.numel() for p in model_without_ddp.cross_modality_encoder.parameters())
         print(f"Froze alignment model ({n_frozen:,} params) for reconstruction stage")
     elif stage == "alignment":
-        args.decoder_type = "flow_matching"
-        print("Alignment stage: register-token alignment + flow reconstruction")
+        print("Alignment stage")
 
     # Build reconstruction decoders (if enabled)
-    recon_decoders = None
-    recon_loss_fn = None
     recon_decoders = {}
-    alignment_hidden_dim = model_without_ddp.alignment_model.hidden_dim
+    recon_loss_fn = None
+    alignment_hidden_dim = model_without_ddp.cross_modality_encoder.hidden_dim
     decoder_type = getattr(args, "decoder_type", "autoregressive")
-    if decoder_type == "flow_matching" and args.recon_loss_type != "mse":
-        raise ValueError("--decoder_type flow_matching requires --recon_loss_type mse")
-    if decoder_type == "autoregressive":
-        for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-            recon_decoders[mod_name] = AutoregressiveDecoder(
-                n_registers=args.n_registers,
-                hidden_dim=alignment_hidden_dim,
-                base_channels=args.recon_base_channels,
-                n_decoder_layers=args.recon_decoder_layers,
-                n_heads=args.n_heads,
-            ).to(device)
-    elif decoder_type == "flow_matching":
-        for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-            recon_decoders[mod_name] = FlowMatchingReconstructionDecoder(
-                n_registers=args.n_registers,
-                hidden_dim=alignment_hidden_dim,
-                base_channels=args.recon_base_channels,
-                n_decoder_layers=args.recon_decoder_layers,
-                n_heads=args.n_heads,
-            ).to(device)
-    else:
-        for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
-            recon_decoders[mod_name] = ReconstructionDecoder(
-                n_registers=args.n_registers,
-                hidden_dim=alignment_hidden_dim,
-                base_channels=args.recon_base_channels,
-                n_decoder_layers=args.recon_decoder_layers,
-                n_heads=args.n_heads,
-            ).to(device)
+    model_cfg = _to_plain_dict(getattr(args, "model", {}))
+    decoder_cfg = model_cfg.get("decoder", {})
+    if not decoder_cfg:
+        raise ValueError("Missing model.decoder config.")
+    for mod_name in [ModalityType.VISION, ModalityType.TACTILE]:
+        mod_cfg = decoder_cfg.get(mod_name, {})
+        if not mod_cfg:
+            raise ValueError(f"Missing model.decoder.{mod_name} config.")
+        recon_decoders[mod_name] = hydra.utils.instantiate(
+            mod_cfg,
+            hidden_dim=alignment_hidden_dim,
+            _convert_="all",
+        ).to(device)
+
+    model_without_ddp.decoder_collection = DecoderCollection(recon_decoders)
+
     # Choose reconstruction objective based on decoder type.
     # Pixel losses (mse/l1/smooth_l1) are used for conv/autoregressive decoders.
     # Flow-matching decoder is trained with a rectified-flow loss in pixel space.
+    losses_cfg = _to_plain_dict(getattr(args, "losses", {}))
+    recon_losses_cfg = losses_cfg.get("reconstruction", {})
+    flow_recon_cfg = recon_losses_cfg.get("flow")
+    pixel_recon_cfg = recon_losses_cfg.get("pixel")
     if decoder_type == "flow_matching":
-        recon_loss_fn = FlowReconstructionLoss(
-            loss_type=args.recon_loss_type,
-            pixel_mse_weight=args.flow_recon_pixel_mse_weight,
-            use_prefix_recon=getattr(args, "use_prefix_recon", False),
-            prefix_weight=getattr(args, "prefix_recon_weight", 0.5),
-        )
+        if not flow_recon_cfg:
+            raise ValueError(
+                "decoder_type='flow_matching' requires losses.reconstruction.flow config"
+            )
+        flow_loss_type = flow_recon_cfg.get("module", {}).get("loss_type")
+        if flow_loss_type != "mse":
+            raise ValueError("decoder_type='flow_matching' requires losses.reconstruction.flow.module.loss_type='mse'")
+        recon_loss_fn = hydra.utils.instantiate(flow_recon_cfg.get("module", {}), _convert_="all")
     else:
-        recon_loss_fn = ReconstructionLoss(loss_type=args.recon_loss_type)
+        if not pixel_recon_cfg:
+            raise ValueError(
+                "decoder_type!='flow_matching' requires losses.reconstruction.pixel config"
+            )
+        recon_loss_fn = hydra.utils.instantiate(pixel_recon_cfg.get("module", {}), _convert_="all")
     n_decoder_params = sum(sum(p.numel() for p in dec.parameters()) for dec in recon_decoders.values())
     print(f"Reconstruction decoders: {n_decoder_params:,} parameters ({len(recon_decoders)} modalities)")
 
     # Prefix reconstruction is computed inside FlowReconstructionLoss when enabled.
-    use_prefix = getattr(args, "use_prefix_recon", False)
+    use_prefix = flow_recon_cfg.get("module", {}).get("use_prefix_recon", False) if flow_recon_cfg else False
     if use_prefix and decoder_type == "flow_matching":
-        prefix_weight = getattr(args, "prefix_recon_weight", 0.5)
+        prefix_weight = flow_recon_cfg.get("module", {}).get("prefix_weight", 0.5)
         print(f"Flow prefix reconstruction enabled (weight={prefix_weight})")
 
     # Logging
@@ -1009,13 +1099,13 @@ def run(args):
 
     # Build loss
     contrastive_loss_fn, flow_loss_fn = build_loss(
-        args, device, embed_dim=model_without_ddp.alignment_model.hidden_dim
+        args, device, embed_dim=model_without_ddp.cross_modality_encoder.hidden_dim
     )
 
     # Optimizer: collect trainable parameters based on stage
     trainable_params = []
     if stage != "reconstruction":
-        trainable_params += list(model_without_ddp.alignment_model.parameters())
+        trainable_params += list(model_without_ddp.cross_modality_encoder.parameters())
         if flow_loss_fn is not None:
             trainable_params += list(flow_loss_fn.parameters())
     if recon_decoders is not None:
@@ -1040,12 +1130,21 @@ def run(args):
     loss_scaler = NativeScaler()
 
     # Resume
-    if args.resume and os.path.exists(args.resume):
-        print(f"Resuming from {args.resume}")
-        ckpt = torch.load(args.resume, map_location="cpu")
-        # In reconstruction stage, alignment model is already loaded and frozen
+    resume_ckpt = _resolve_resume_checkpoint(args)
+    if resume_ckpt is not None:
+        print(f"Resuming from {resume_ckpt}")
+        ckpt = torch.load(resume_ckpt, map_location="cpu")
+        # In reconstruction stage, cross-modality encoder is already loaded and frozen
         if stage != "reconstruction":
-            model_without_ddp.alignment_model.load_state_dict(ckpt.get("alignment_model", {}), strict=False)
+            state = ckpt.get("cross_modality_encoder", ckpt.get("alignment_model", {}))
+            if state:
+                msg = model_without_ddp.cross_modality_encoder.load_state_dict(state, strict=False)
+                print(
+                    "[resume] loaded alignment weights "
+                    f"(missing: {len(msg.missing_keys)}, unexpected: {len(msg.unexpected_keys)})"
+                )
+            else:
+                print("[resume] no alignment state found in checkpoint")
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scaler" in ckpt:
@@ -1054,9 +1153,13 @@ def run(args):
             for mod_name, dec in recon_decoders.items():
                 key = f"recon_decoder_{mod_name}"
                 if key in ckpt:
-                    dec.load_state_dict(ckpt[key])
-                    print(f"  Loaded reconstruction decoder for {mod_name}")
+                    msg = dec.load_state_dict(ckpt[key], strict=False)
+                    print(
+                        f"  Loaded reconstruction decoder for {mod_name} "
+                        f"(missing: {len(msg.missing_keys)}, unexpected: {len(msg.unexpected_keys)})"
+                    )
         args.start_epoch = ckpt.get("epoch", 0) + 1
+        print(f"[resume] start_epoch={args.start_epoch}")
 
     # Training loop
     print(f"Start training for {args.epochs} epochs")
@@ -1074,7 +1177,7 @@ def run(args):
             recon_decoders=recon_decoders, recon_loss_fn=recon_loss_fn,
         )
 
-        val_stats = evaluate(data_loader_val, contrastive_loss_fn, model, device,
+        val_stats = evaluate(data_loader_val, contrastive_loss_fn, flow_loss_fn, model, device,
                              epoch=epoch, log_writer=log_writer,
                              recon_decoders=recon_decoders, recon_loss_fn=recon_loss_fn, args=args,
                              stage=stage, output_dir=args.output_dir)
@@ -1089,7 +1192,8 @@ def run(args):
         # Save checkpoint
         if args.output_dir:
             save_dict = {
-                "alignment_model": model_without_ddp.alignment_model.state_dict(),
+                "cross_modality_encoder": model_without_ddp.cross_modality_encoder.state_dict(),
+                "alignment_model": model_without_ddp.cross_modality_encoder.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scaler": loss_scaler.state_dict(),
                 "epoch": epoch,
@@ -1158,5 +1262,39 @@ def hydra_main(cfg: DictConfig):
     run(args)
 
 
+def _rewrite_resume_cli_for_hydra(argv):
+    """Allow argparse-style --resume flags with Hydra entrypoint.
+
+    Examples:
+      --resume                  -> resume=auto
+      --resume /path/ckpt.pth   -> resume=/path/ckpt.pth
+      --resume=/path/ckpt.pth   -> resume=/path/ckpt.pth
+    """
+    rewritten = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--resume":
+            if (
+                i + 1 < len(argv)
+                and not argv[i + 1].startswith("-")
+                and "=" not in argv[i + 1]
+            ):
+                rewritten.append(f"resume={argv[i + 1]}")
+                i += 2
+            else:
+                rewritten.append("resume=auto")
+                i += 1
+            continue
+        if token.startswith("--resume="):
+            rewritten.append(f"resume={token.split('=', 1)[1]}")
+            i += 1
+            continue
+        rewritten.append(token)
+        i += 1
+    return rewritten
+
+
 if __name__ == "__main__":
+    sys.argv = [sys.argv[0]] + _rewrite_resume_cli_for_hydra(sys.argv[1:])
     hydra_main()

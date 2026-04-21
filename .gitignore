@@ -163,3 +163,4 @@ dataset
 ckpts
 output
 train.sh
+logs/

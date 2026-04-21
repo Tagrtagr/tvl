@@ -1,0 +1,14 @@
+alignment: {}
+
+decoder_type: flow_matching
+
+reconstruction:
+  weight: 1.0
+  flow:
+    module:
+      _target_: losses.flow_reconstruction_loss.FlowReconstructionLoss
+      loss_type: mse
+      pixel_mse_weight: 1.0
+      use_prefix_recon: false
+      prefix_weight: 0.5
+

@@ -1,0 +1,29 @@
+register_cross_modal:
+  _target_: models.cross_modal_alignment.CrossModalAlignmentModel
+  n_registers: ${n_registers}
+  n_shared: ${n_shared}
+  n_layers: ${n_layers}
+  n_heads: ${n_heads}
+  dropout: ${model_dropout}
+  nested_dropout: ${nested_dropout}
+  nested_dropout_mode: ${nested_dropout_mode}
+  use_token_type_embed: ${use_token_type_embed}
+  private_dropout_p: 0.1
+  fsq_levels: [8, 8, 8, 5, 5, 5]
+  fsq_drop_quant_p: 0.0
+
+decoder:
+  vision:
+    _target_: models.autoregressive_decoder.AutoregressiveDecoder
+    n_registers: ${n_registers}
+    hidden_dim: ${hidden_dim}
+    base_channels: ${recon_base_channels}
+    n_decoder_layers: ${recon_decoder_layers}
+    n_heads: ${n_heads}
+  tactile:
+    _target_: models.autoregressive_decoder.AutoregressiveDecoder
+    n_registers: ${n_registers}
+    hidden_dim: ${hidden_dim}
+    base_channels: ${recon_base_channels}
+    n_decoder_layers: ${recon_decoder_layers}
+    n_heads: ${n_heads}
