@@ -72,17 +72,29 @@ class Registers1D(nn.Module):
         if use_token_type_embed:
             self.token_type_embed = nn.Parameter(torch.randn(1, n_registers, hidden_dim) * 0.02)
 
-        # Pre-compute valid K_keep values for nested dropout on SHARED tokens only.
-        if nested_dropout_mode == "power_of_two":
-            self._k_keep_shared_values = []
-            k = 1
-            while k <= n_shared:
-                self._k_keep_shared_values.append(k)
-                k *= 2
-            if self._k_keep_shared_values and self._k_keep_shared_values[-1] != n_shared:
-                self._k_keep_shared_values.append(n_shared)
-        else:
-            self._k_keep_shared_values = list(range(1, n_shared + 1))
+        def _make_schedule(n: int, min_k: int = 1) -> list:
+            min_k = max(1, min_k)
+            if nested_dropout_mode == "power_of_two":
+                vals = []
+                k = min_k
+                while k <= n:
+                    vals.append(k)
+                    k *= 2
+                if not vals or vals[-1] != n:
+                    vals.append(n)
+                return vals
+            return list(range(min_k, n + 1))
+
+        # Shared tokens: aggressive dropout (1 → n_shared powers of two) so that
+        # even a single shared token produces a valid cross-modal embedding.
+        self._k_keep_shared_values = _make_schedule(n_shared)
+
+        # Private tokens: start at n_private//4 (not 1) so the probe decoder always
+        # receives at least 25% of the reconstruction-critical private tokens.
+        # Old schedule [1, 2, 4, 8, …, n_private] gave E[k_keep] ≈ n_private/7,
+        # starving the decoder of private information on the full dataset.
+        private_min_k = max(1, self.n_private // 4) if self.n_private > 0 else 1
+        self._k_keep_private_values = _make_schedule(self.n_private, min_k=private_min_k) if self.n_private > 0 else []
 
         self._init_weights()
 
@@ -103,6 +115,12 @@ class Registers1D(nn.Module):
             return self.n_shared
         idx = torch.randint(0, len(self._k_keep_shared_values), (1,)).item()
         return int(self._k_keep_shared_values[idx])
+
+    def _sample_k_keep_private(self) -> int:
+        if not self._k_keep_private_values:
+            return self.n_private
+        idx = torch.randint(0, len(self._k_keep_private_values), (1,)).item()
+        return int(self._k_keep_private_values[idx])
 
     def expand_registers(self, batch_size: int) -> torch.Tensor:
         """Return (B, n_registers, hidden_dim) registers (no dropout applied)."""
@@ -139,30 +157,34 @@ class Registers1D(nn.Module):
         regs[:, k_keep:self.n_shared, :] = 0.0
         return regs, k_keep
 
-    def apply_private_token_dropout(
+    def apply_private_nested_dropout(
         self,
         registers: torch.Tensor,
         *,
         apply: bool,
-    ) -> torch.Tensor:
-        """Apply token-wise dropout on private registers only."""
-        if (not apply) or self.n_private <= 0 or self.private_dropout_p <= 0.0:
-            return registers
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Optionally zero-out private registers beyond k_keep (power-of-two schedule).
 
-        keep_prob = 1.0 - self.private_dropout_p
+        Mirrors apply_shared_nested_dropout but operates on the private token range
+        [n_shared : n_registers]. Applied independently from the shared dropout —
+        each group samples its own k_keep, enforcing coarse-to-fine ordering within
+        both shared and private token sets.
+
+        Returns:
+            registers_dropped: (B, n_registers, D)
+            k_keep: number of private tokens kept, or n_private if not applied
+        """
+        if not apply or self.n_private <= 0:
+            return registers, self.n_private
+
+        k_keep = self._sample_k_keep_private()
+        if k_keep >= self.n_private:
+            return registers, self.n_private
+
         regs = registers.clone()
-        # Token-wise dropout mask for private tokens; scaled to keep expectation.
-        mask = (
-            torch.rand(
-                regs.shape[0],
-                self.n_private,
-                1,
-                device=regs.device,
-                dtype=regs.dtype,
-            ) < keep_prob
-        ).to(regs.dtype)
-        regs[:, self.n_shared :, :] = regs[:, self.n_shared :, :] * mask / keep_prob
-        return regs
+        regs[:, self.n_shared + k_keep : self.n_shared + self.n_private, :] = 0.0
+        return regs, k_keep
 
 
 class RegisterTokenTransformer(nn.Module):
@@ -298,7 +320,7 @@ class RegisterTokenModule(nn.Module):
         self,
         encoder_features: torch.Tensor,
         apply_nested_dropout: Optional[bool] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
         """
         Args:
             encoder_features: (B, N, input_dim) frozen encoder output.
@@ -308,7 +330,8 @@ class RegisterTokenModule(nn.Module):
         Returns:
             shared_tokens: (B, n_shared, hidden_dim) - for cross-modal contrastive alignment
             private_tokens: (B, n_private, hidden_dim) - modality-specific preservation
-            k_keep: Number of shared tokens kept (n_shared if no dropout applied)
+            k_keep_shared: number of shared tokens kept after nested dropout
+            k_keep_private: number of private tokens kept after nested dropout
         """
         B, N, _ = encoder_features.shape
 
@@ -325,19 +348,20 @@ class RegisterTokenModule(nn.Module):
         # Extract only register tokens (discard input tokens)
         register_out = x[:, N:, :]  # (B, n_registers, hidden_dim)
 
-        # Apply nested dropout only to shared registers (private always intact).
+        # Apply nested dropout independently to shared and private token groups.
+        # Each group samples its own k_keep, enforcing coarse-to-fine ordering within both sets.
         use_dropout = (
             apply_nested_dropout
             if apply_nested_dropout is not None
             else (self.nested_dropout and self.training)
         )
-        register_out, k_keep = self.registers.apply_shared_nested_dropout(register_out, apply=use_dropout)
-        register_out = self.registers.apply_private_token_dropout(register_out, apply=use_dropout)
+        register_out, k_keep_shared = self.registers.apply_shared_nested_dropout(register_out, apply=use_dropout)
+        register_out, k_keep_private = self.registers.apply_private_nested_dropout(register_out, apply=use_dropout)
 
         shared_tokens = register_out[:, : self.n_shared, :]
         private_tokens = register_out[:, self.n_shared :, :]
 
-        return shared_tokens, private_tokens, k_keep
+        return shared_tokens, private_tokens, k_keep_shared, k_keep_private
 
 
 class RegisterTransformerLayer(nn.Module):

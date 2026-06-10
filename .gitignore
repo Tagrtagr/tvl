@@ -165,3 +165,4 @@ output
 train.sh
 submit.sh
 logs/
+wandb/

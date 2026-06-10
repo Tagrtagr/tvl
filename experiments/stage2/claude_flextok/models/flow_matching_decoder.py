@@ -155,12 +155,21 @@ class FlowMatchingReconstructionDecoder(nn.Module):
 
 
 class PatchTokenBlock(nn.Module):
-    """Self-attn over patches + cross-attn to tokens, with AdaLN(time)."""
+    """Self-attn over patches + cross-attn to tokens, with DiT-style AdaLN(time).
+
+    AdaLN modulates self-attn and MLP with time-conditioned scale/shift/gate.
+    Cross-attn is conditioned directly by the register tokens (no time modulation).
+    Each sublayer has its own LayerNorm to avoid parameter sharing across roles.
+    """
 
     def __init__(self, hidden_dim: int, n_heads: int, dropout: float):
         super().__init__()
-        self.norm_q = nn.LayerNorm(hidden_dim, elementwise_affine=False)
-        self.norm_kv = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        # Separate norms per sublayer — elementwise_affine=False because AdaLN
+        # provides the affine transform from the time embedding.
+        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)   # self-attn
+        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)   # cross-attn Q
+        self.norm3 = nn.LayerNorm(hidden_dim, elementwise_affine=False)   # MLP
+        self.norm_kv = nn.LayerNorm(hidden_dim, elementwise_affine=False) # cross-attn KV
 
         self.self_attn = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout, batch_first=True)
         self.cross_attn = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout, batch_first=True)
@@ -173,26 +182,30 @@ class PatchTokenBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-        self.ada = nn.Linear(hidden_dim, hidden_dim * 6)  # scales/shifts/gates for 3 sublayers
+        # DiT-style: 6 AdaLN params = (scale, shift, gate) × (self-attn, MLP).
+        # Cross-attn is time-invariant — tokens carry the conditioning signal.
+        # Zero-init so the block starts as identity w.r.t. the time signal.
+        self.ada = nn.Linear(hidden_dim, hidden_dim * 6)
+        nn.init.zeros_(self.ada.weight)
+        nn.init.zeros_(self.ada.bias)
 
     def forward(self, x: torch.Tensor, tokens: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        # Compute AdaLN params
-        # (B, 6D) -> scale/shift/gate for self-attn, cross-attn, mlp
-        ssa_s, ssa_b, ssa_g, ca_s, ca_b, mlp_g = self.ada(t_emb).chunk(6, dim=-1)
+        sa_s, sa_b, sa_g, mlp_s, mlp_b, mlp_g = self.ada(t_emb).chunk(6, dim=-1)
 
-        # Self-attn (patches)
-        h = self.norm_q(x) * (1 + ssa_s.unsqueeze(1)) + ssa_b.unsqueeze(1)
+        # Self-attn with AdaLN(time)
+        h = self.norm1(x) * (1 + sa_s.unsqueeze(1)) + sa_b.unsqueeze(1)
         attn, _ = self.self_attn(h, h, h)
-        x = x + torch.tanh(ssa_g).unsqueeze(1) * attn
+        x = x + torch.tanh(sa_g).unsqueeze(1) * attn
 
-        # Cross-attn (patches query, tokens key/value)
-        q = self.norm_q(x) * (1 + ca_s.unsqueeze(1)) + ca_b.unsqueeze(1)
+        # Cross-attn: patches (query) attend to register tokens (key/value)
+        q = self.norm2(x)
         kv = self.norm_kv(tokens)
         attn2, _ = self.cross_attn(q, kv, kv)
         x = x + attn2
 
-        # MLP
-        x = x + torch.tanh(mlp_g).unsqueeze(1) * self.mlp(self.norm_q(x))
+        # MLP with AdaLN(time)
+        h = self.norm3(x) * (1 + mlp_s.unsqueeze(1)) + mlp_b.unsqueeze(1)
+        x = x + torch.tanh(mlp_g).unsqueeze(1) * self.mlp(h)
         return x
 
 

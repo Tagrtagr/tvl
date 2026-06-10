@@ -32,9 +32,11 @@ class FlowReconstructionLoss(nn.Module):
         self,
         loss_type: str = "mse",
         timestep_sampling: str = "logit_normal",
+        logit_normal_std: float = 1.0,
         pixel_mse_weight: float = 1.0,
         use_prefix_recon: bool = False,
         prefix_weight: float = 0.5,
+        scale_weights=None,  # accepted but unused; belongs to ReconstructionLoss
     ):
         super().__init__()
         if loss_type != "mse":
@@ -42,13 +44,17 @@ class FlowReconstructionLoss(nn.Module):
             # We keep the arg for CLI compatibility but enforce MSE.
             raise ValueError("FlowReconstructionLoss currently supports loss_type='mse' only")
         self.timestep_sampling = timestep_sampling
+        self.logit_normal_std = float(logit_normal_std)
         self.pixel_mse_weight = float(pixel_mse_weight)
         self.use_prefix_recon = bool(use_prefix_recon)
         self.prefix_weight = float(prefix_weight)
 
     def sample_timestep(self, batch_size: int, device: torch.device) -> torch.Tensor:
         if self.timestep_sampling == "logit_normal":
-            u = torch.randn(batch_size, device=device) * 0.25
+            # std=1.0 matches SD3 — covers the full [0,1] range during training.
+            # std=0.25 was too narrow (~90% of samples in [0.38, 0.62]), causing the
+            # model to extrapolate poorly at t<0.3 and t>0.7 during Euler integration.
+            u = torch.randn(batch_size, device=device) * self.logit_normal_std
             t = torch.sigmoid(u)
         else:
             t = torch.rand(batch_size, device=device)

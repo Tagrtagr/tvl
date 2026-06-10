@@ -1,7 +1,7 @@
 defaults:
   - pipeline: default
-  - model: default
-  - losses: default
+  - model: alignment
+  - losses: alignment
   - _self_
 
 hydra:
@@ -11,7 +11,7 @@ hydra:
 
 # Core model dimensions
 hidden_dim: 512
-n_registers: 32
+n_registers: 64
 n_shared: 8
 n_layers: 4
 n_heads: 8
@@ -20,18 +20,17 @@ nested_dropout: true
 nested_dropout_mode: power_of_two
 use_token_type_embed: true
 
-# Decoder defaults (consumed by model group)
+# Decoder architecture (consumed by model group via interpolation)
 recon_base_channels: 64
 recon_decoder_layers: 2
-decoder_type: autoregressive  # conv | autoregressive | flow_matching
 
 # Stage split
-stage: joint  # alignment | reconstruction | joint
+stage: alignment  # alignment | reconstruction | joint
 alignment_checkpoint: null
 
 # Training
 batch_size: 64
-epochs: 100
+epochs: 200
 accum_iter: 1
 lr: null
 blr: 3e-4
@@ -75,6 +74,7 @@ log_dir: null
 log_name: null
 resume: ""
 start_epoch: 0
+
 
 # Distributed
 device: cuda

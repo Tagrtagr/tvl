@@ -1,0 +1,8 @@
+recon_decoder:
+  weight: 1.0
+  pixel:
+    module:
+      _target_: losses.reconstruction_loss.ReconstructionLoss
+      loss_type: l1
+      # Multi-scale supervision: half- and quarter-resolution auxiliary losses.
+      scale_weights: [[0.5, 0.5], [0.25, 0.25]]

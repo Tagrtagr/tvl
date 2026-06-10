@@ -1,0 +1,16 @@
+contrastive:
+  weight: 1.0
+  module:
+    _target_: losses.alignment_loss.CrossModalAlignmentLoss
+    contrastive_weight: 1.0
+    preservation_weight: 0.0
+    latent_dim: ${hidden_dim}
+
+# Autoregressive probe: forces tokens to retain pixel-reconstructable information
+# while contrastive loss aligns them cross-modally (information-bottleneck role).
+probe:
+  weight: 1.0
+  module:
+    _target_: losses.flow_reconstruction_loss.FlowReconstructionLoss
+    timestep_sampling: logit_normal
+    pixel_mse_weight: 1.0

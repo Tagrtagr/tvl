@@ -17,22 +17,29 @@ from typing import Dict, Optional, List
 
 class ReconstructionLoss(nn.Module):
     """
-    Pixel-space reconstruction loss.
+    Pixel-space reconstruction loss with optional multi-scale supervision.
 
     Args:
         loss_type: "mse", "l1", or "smooth_l1".
         perceptual_weight: Weight for optional feature-space loss.
             If 0, only pixel loss is used (faster).
+        scale_weights: List of (scale_factor, weight) pairs for multi-scale loss.
+            E.g. [(0.5, 0.5), (0.25, 0.25)] adds half- and quarter-resolution losses.
+            Multi-scale supervision encourages the decoder to learn both coarse
+            structure (low-res) and fine details (full-res) simultaneously.
     """
 
     def __init__(
         self,
         loss_type: str = "mse",
         perceptual_weight: float = 0.0,
+        scale_weights: Optional[List] = None,
     ):
         super().__init__()
         self.loss_type = loss_type
         self.perceptual_weight = perceptual_weight
+        # Each entry is (scale_factor: float, weight: float)
+        self.scale_weights: List = list(scale_weights) if scale_weights else []
 
         if loss_type == "mse":
             self.pixel_loss_fn = nn.MSELoss()
@@ -74,8 +81,19 @@ class ReconstructionLoss(nn.Module):
             recon = reconstructions[mod_name]
             target = targets[mod_name]
 
-            # Pixel loss
+            # Pixel loss (full resolution)
             pixel_loss = self.pixel_loss_fn(recon, target)
+            # Multi-scale auxiliary losses
+            for scale_factor, scale_weight in self.scale_weights:
+                r_down = F.interpolate(
+                    recon, scale_factor=scale_factor, mode="bilinear",
+                    align_corners=False, recompute_scale_factor=False,
+                )
+                t_down = F.interpolate(
+                    target.detach(), scale_factor=scale_factor, mode="bilinear",
+                    align_corners=False, recompute_scale_factor=False,
+                )
+                pixel_loss = pixel_loss + scale_weight * self.pixel_loss_fn(r_down, t_down)
             losses[f"recon_pixel_{mod_name}"] = pixel_loss
             total_pixel += pixel_loss
 

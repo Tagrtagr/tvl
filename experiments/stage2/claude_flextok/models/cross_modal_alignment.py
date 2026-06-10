@@ -234,12 +234,17 @@ class CrossModalAlignmentModel(nn.Module):
     def forward(
         self,
         feature_dict: Dict[str, torch.Tensor],
+        apply_nested_dropout: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
             feature_dict: Maps modality name -> frozen encoder features.
                 Vision: (B, 768) or (B, N, 768) depending on pooling.
                 Tactile: (B, 768) or (B, N, 768).
+            apply_nested_dropout: Override the module's built-in dropout setting.
+                None = use model's self.nested_dropout (default).
+                False = always disable (e.g., reconstruction-only training).
+                True = always enable.
 
         Returns:
             Dictionary with:
@@ -258,12 +263,14 @@ class CrossModalAlignmentModel(nn.Module):
             features = feature_dict[mod_name]
             features = self._prepare_features(features, self.feature_types[mod_name])
 
-            shared_tokens, private_tokens, k_keep = self.module_dict[f"{mod_name}_register_module"](features)
+            shared_tokens, private_tokens, k_keep_shared, k_keep_private = self.module_dict[f"{mod_name}_register_module"](
+                features, apply_nested_dropout=apply_nested_dropout
+            )
 
             # Pool only non-zeroed shared tokens to avoid dilution from nested dropout.
-            # k_keep indicates how many shared tokens are active (rest are zeroed).
-            if k_keep < shared_tokens.shape[1]:
-                shared_pooled = shared_tokens[:, :k_keep, :].mean(dim=1)
+            # k_keep_shared indicates how many shared tokens are active (rest are zeroed).
+            if k_keep_shared < shared_tokens.shape[1]:
+                shared_pooled = shared_tokens[:, :k_keep_shared, :].mean(dim=1)
             else:
                 shared_pooled = shared_tokens.mean(dim=1)  # (B, hidden_dim)
             shared_proj = self.shared_projectors[mod_name](shared_pooled)
@@ -272,7 +279,8 @@ class CrossModalAlignmentModel(nn.Module):
             output[f"{mod_name}_shared"] = shared_proj
             output[f"{mod_name}_private"] = private_tokens
             output[f"{mod_name}_shared_tokens"] = shared_tokens
-            output[f"{mod_name}_k_keep"] = k_keep
+            output[f"{mod_name}_k_keep"] = k_keep_shared
+            output[f"{mod_name}_k_keep_private"] = k_keep_private
             # All register tokens (for reconstruction decoder)
             all_tokens = torch.cat([shared_tokens, private_tokens], dim=1)
             output[f"{mod_name}_all_tokens"] = all_tokens
@@ -335,7 +343,11 @@ class Stage2Wrapper(nn.Module):
         out.pop("logit_bias", None)
         return out
 
-    def forward(self, input_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        input_dict: Dict[str, torch.Tensor],
+        apply_nested_dropout: Optional[bool] = None,
+    ) -> Dict[str, torch.Tensor]:
         """Full forward: frozen encode -> alignment."""
         frozen_features = self.encode(input_dict)
-        return self.alignment_model(frozen_features)
+        return self.alignment_model(frozen_features, apply_nested_dropout=apply_nested_dropout)
